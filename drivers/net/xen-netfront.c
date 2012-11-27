@@ -54,6 +54,8 @@
 #include <xen/interface/memory.h>
 #include <xen/interface/grant_table.h>
 
+#define MAX_RING_PAGES 4
+
 static const struct ethtool_ops xennet_ethtool_ops;
 
 struct netfront_cb {
@@ -66,12 +68,12 @@ struct netfront_cb {
 
 #define GRANT_INVALID_REF	0
 
-#define NET_TX_RING_SIZE __CONST_RING_SIZE(xen_netif_tx, PAGE_SIZE)
-#define NET_RX_RING_SIZE __CONST_RING_SIZE(xen_netif_rx, PAGE_SIZE)
-#define TX_MAX_TARGET min_t(int, NET_TX_RING_SIZE, 256)
+#define NET_TX_RING_SIZE(nr_pages) __CONST_RING_SIZE(xen_netif_tx, PAGE_SIZE * nr_pages)
+#define NET_RX_RING_SIZE(nr_pages) __CONST_RING_SIZE(xen_netif_rx, PAGE_SIZE * nr_pages)
+#define TX_MAX_TARGET(nr_pages) min_t(int, NET_TX_RING_SIZE(nr_pages), 256)
 #define RX_MIN_TARGET 8
 #define RX_DFL_MIN_TARGET 64
-#define RX_MAX_TARGET min_t(int, NET_RX_RING_SIZE, 256)
+#define RX_MAX_TARGET(nr_pages) min_t(int, NET_RX_RING_SIZE(nr_pages), 256)
 
 struct netfront_stats {
 	u64			rx_packets;
@@ -110,7 +112,7 @@ struct netfront_info {
 	unsigned tx_skb_freelist;
 	struct xen_netif_tx_front_ring tx;
 	grant_ref_t gref_tx_head;
-	/* Four bytes padding here */
+	unsigned nr_ring_pages;
 	struct net_device *netdev;
 	struct tx_slot *tx_slots;
 
@@ -139,8 +141,15 @@ struct netfront_info {
 	 * teardown. */
 	struct xenbus_device *xbdev;
 	unsigned int evtchn;
-	grant_ref_t tx_ring_ref;
-	grant_ref_t rx_ring_ref;
+	/* The xenbus protocol makes a distinction between a
+	   single-page ring (i.e. the backend is old and doesn't know
+	   about multi-page ones) and a multi-page ring which happens
+	   to only have one page (i.e. the backend does know about
+	   multi-page rings but doesn't want to use them).  This is a
+	   flag telling you which type you've got. */
+	int multipage_ring;
+	grant_ref_t tx_ring_refs[MAX_RING_PAGES];
+	grant_ref_t rx_ring_refs[MAX_RING_PAGES];
 };
 
 struct netfront_rx_info {
@@ -178,24 +187,24 @@ static unsigned short get_id_from_freelist(unsigned *head,
 	return id;
 }
 
-static int xennet_rxidx(RING_IDX idx)
+static int xennet_rxidx(const struct netfront_info *np, RING_IDX idx)
 {
-	return idx & (NET_RX_RING_SIZE - 1);
+	return idx & (NET_RX_RING_SIZE(np->nr_ring_pages) - 1);
 }
 
 static struct sk_buff *xennet_get_rx_skb(struct netfront_info *np,
 					 RING_IDX ri)
 {
-	int i = xennet_rxidx(ri);
+	int i = xennet_rxidx(np, ri);
 	struct sk_buff *skb = np->rx_slots[i].skb;
 	np->rx_slots[i].skb = NULL;
 	return skb;
 }
 
 static grant_ref_t xennet_get_rx_ref(struct netfront_info *np,
-					    RING_IDX ri)
+				     RING_IDX ri)
 {
-	int i = xennet_rxidx(ri);
+	int i = xennet_rxidx(np, ri);
 	grant_ref_t ref = np->rx_slots[i].gref;
 	np->rx_slots[i].gref = GRANT_INVALID_REF;
 	return ref;
@@ -225,7 +234,7 @@ static void rx_refill_timeout(unsigned long data)
 static int netfront_tx_slot_available(struct netfront_info *np)
 {
 	return (np->tx.req_prod_pvt - np->tx.rsp_cons) <
-		(TX_MAX_TARGET - MAX_SKB_FRAGS - 2);
+		(TX_MAX_TARGET(np->nr_ring_pages) - MAX_SKB_FRAGS - 2);
 }
 
 static void xennet_maybe_wake_tx(struct net_device *dev)
@@ -308,7 +317,7 @@ no_skb:
 
 		skb->dev = dev;
 
-		id = xennet_rxidx(req_prod + i);
+		id = xennet_rxidx(np, req_prod + i);
 
 		BUG_ON(np->rx_slots[id].skb);
 		np->rx_slots[id].skb = skb;
@@ -604,7 +613,7 @@ static int xennet_close(struct net_device *dev)
 static void xennet_move_rx_slot(struct netfront_info *np, struct sk_buff *skb,
 				grant_ref_t ref)
 {
-	int new = xennet_rxidx(np->rx.req_prod_pvt);
+	int new = xennet_rxidx(np, np->rx.req_prod_pvt);
 
 	BUG_ON(np->rx_slots[new].skb);
 	np->rx_slots[new].skb = skb;
@@ -1079,11 +1088,30 @@ static struct rtnl_link_stats64 *xennet_get_stats64(struct net_device *dev,
 	return tot;
 }
 
-static void xennet_end_access(int ref, void *page)
+static void xennet_end_access(int nr_refs, grant_ref_t *refs, void *base)
 {
-	/* This frees the page as a side-effect */
-	if (ref != GRANT_INVALID_REF)
-		gnttab_end_foreign_access(ref, 0, (unsigned long)page);
+	int i;
+	int failed = 0;
+
+	for (i = 0; i < nr_refs; i++) {
+		if (refs[i] == GRANT_INVALID_REF)
+			continue;
+		if (gnttab_end_foreign_access_ref(refs[i], 0)) {
+			gnttab_free_grant_reference(refs[i]);
+			refs[i] = GRANT_INVALID_REF;
+		} else {
+			failed = 1;
+		}
+	}
+	if (!failed) {
+		vfree(base);
+	} else {
+		/* XXX should really do a deferred vfree on the
+		   memory, so as to avoid leaking memory when a
+		   backend misbehaves. */
+		printk(KERN_WARNING "Leaking %d pages fo ring memory because the backend refused to relinquish them.\n",
+		       nr_refs);
+	}
 }
 
 /* Called from the xenbus probe thread. */
@@ -1103,16 +1131,18 @@ static void xennet_disconnect_backend(struct netfront_info *info)
 	info->evtchn = info->netdev->irq = 0;
 
 	/* End access and free the pages */
-	xennet_end_access(info->tx_ring_ref, info->tx.sring);
-	xennet_end_access(info->rx_ring_ref, info->rx.sring);
+	xennet_end_access(info->nr_ring_pages, info->tx_ring_refs, info->tx.sring);
+	xennet_end_access(info->nr_ring_pages, info->rx_ring_refs, info->rx.sring);
 
-	info->tx_ring_ref = GRANT_INVALID_REF;
-	info->rx_ring_ref = GRANT_INVALID_REF;
+	for (i = 0; i < MAX_RING_PAGES; i++) {
+		info->tx_ring_refs[i] = GRANT_INVALID_REF;
+		info->rx_ring_refs[i] = GRANT_INVALID_REF;
+	}
 	info->tx.sring = NULL;
 	info->rx.sring = NULL;
 
 	if (info->tx_slots) {
-		for (i = 0; i < NET_TX_RING_SIZE; i++) {
+		for (i = 0; i < NET_TX_RING_SIZE(info->nr_ring_pages); i++) {
 			/* Skip over entries which are actually freelist references */
 			if (skb_entry_is_link(&info->tx_slots[i]))
 				continue;
@@ -1137,7 +1167,7 @@ static void xennet_disconnect_backend(struct netfront_info *info)
 	}
 
 	if (info->rx_slots) {
-		for (i = 0; i < NET_RX_RING_SIZE; i++) {
+		for (i = 0; i < NET_RX_RING_SIZE(info->nr_ring_pages); i++) {
 			if (info->rx_slots[i].gref != GRANT_INVALID_REF) {
 				if (gnttab_end_foreign_access_ref(info->rx_slots[i].gref, 0))
 					gnttab_release_grant_reference(&info->gref_tx_head,
@@ -1254,6 +1284,7 @@ static struct net_device * __devinit xennet_create_dev(struct xenbus_device *dev
 {
 	struct net_device *netdev;
 	struct netfront_info *np;
+	int i;
 
 	netdev = alloc_etherdev(sizeof(struct netfront_info));
 	if (!netdev)
@@ -1268,6 +1299,9 @@ static struct net_device * __devinit xennet_create_dev(struct xenbus_device *dev
 	np->otherend_id           = dev->otherend_id;
 	memset(&np->tx, 0, sizeof(np->tx));
 	np->gref_tx_head          = GRANT_INVALID_REF;
+	/* This will be reinitialised before using.  Set a poison
+	   value to make it moderately obvious if we forget. */
+	np->nr_ring_pages         = 0xdeaddead;
 	np->netdev                = netdev;
 	np->tx_slots              = NULL;
 	netif_napi_add(netdev, &np->napi, xennet_poll, 64);
@@ -1277,7 +1311,9 @@ static struct net_device * __devinit xennet_create_dev(struct xenbus_device *dev
 	np->rx_gso_checksum_fixup = 0;
 	np->rx_target             = RX_DFL_MIN_TARGET;
 	np->rx_min_target         = RX_DFL_MIN_TARGET;
-	np->rx_max_target         = RX_MAX_TARGET;
+	/* Must be initialised once we know how many ring pages we
+	 * have */
+	np->rx_max_target         = 0xbeefbeef;
 	skb_queue_head_init(&np->rx_batch);
 	np->rx_slots              = NULL;
 	init_timer(&np->rx_refill_timer);
@@ -1285,8 +1321,12 @@ static struct net_device * __devinit xennet_create_dev(struct xenbus_device *dev
 	np->rx_refill_timer.function = rx_refill_timeout;
 	np->xbdev                 = dev;
 	np->evtchn                = 0;
-	np->tx_ring_ref           = GRANT_INVALID_REF;
-	np->rx_ring_ref           = GRANT_INVALID_REF;
+	/* Must be initialised later. */
+	np->multipage_ring        = 0xbeeff001;
+	for (i = 0; i < MAX_RING_PAGES; i++) {
+		np->tx_ring_refs[i] = GRANT_INVALID_REF;
+		np->rx_ring_refs[i] = GRANT_INVALID_REF;
+	}
 
 	np->stats = alloc_percpu(struct netfront_stats);
 	if (np->stats == NULL) {
@@ -1402,64 +1442,93 @@ static int xen_net_read_mac(struct xenbus_device *dev, u8 mac[])
 static int setup_netfront(struct xenbus_device *dev, struct netfront_info *info)
 {
 	struct net_device *netdev = info->netdev;
+	int max_pages;
+	int multipage;
+	int nr_ring_pages;
 	struct tx_slot *tx_slots = NULL;
 	struct rx_slot *rx_slots = NULL;
 	struct xen_netif_tx_sring *txs = NULL;
 	struct xen_netif_rx_sring *rxs = NULL;
-	grant_ref_t tx_ring_ref = GRANT_INVALID_REF;
-	grant_ref_t rx_ring_ref = GRANT_INVALID_REF;
 	grant_ref_t gref_tx_head = GRANT_INVALID_REF;
 	grant_ref_t gref_rx_head = GRANT_INVALID_REF;
 	int evtchn = -1;
+	grant_ref_t *ring_refs = NULL;
 	int err;
 	int irq;
 	int i;
 
+	/* Grab backend parameters */
 	err = xen_net_read_mac(dev, netdev->dev_addr);
 	if (err) {
 		xenbus_dev_fatal(dev, err, "parsing %s/mac", dev->nodename);
 		goto fail;
 	}
+	err = xenbus_scanf(XBT_NIL, dev->otherend, "feature-max-ring-pages",
+			   "%d", &max_pages);
+	if (err < 0) {
+		max_pages = 1;
+		multipage = 0;
+	} else {
+		multipage = 1;
+	}
+	for (nr_ring_pages = 1;
+	     nr_ring_pages < MAX_RING_PAGES && (nr_ring_pages << 1) <= max_pages;
+	     nr_ring_pages <<= 1)
+		;
 
-	/* First allocate all of the resources we're going to need. */
+	/* Allocate resources */
 	err = -ENOMEM;
-	tx_slots = kzalloc(sizeof(tx_slots[0]) * NET_TX_RING_SIZE, GFP_KERNEL);
-	rx_slots = kzalloc(sizeof(rx_slots[0]) * NET_RX_RING_SIZE, GFP_KERNEL);
-	txs = (struct xen_netif_tx_sring *)get_zeroed_page(GFP_NOIO | __GFP_HIGH);
-	rxs = (struct xen_netif_rx_sring *)get_zeroed_page(GFP_NOIO | __GFP_HIGH);
+#warning tx_slots and rx_slots are quite big; should maybe be vmalloc()?
+	tx_slots = kzalloc(sizeof(tx_slots[0]) * NET_TX_RING_SIZE(nr_ring_pages), GFP_KERNEL);
+	rx_slots = kzalloc(sizeof(rx_slots[0]) * NET_RX_RING_SIZE(nr_ring_pages), GFP_KERNEL);
+	txs = __vmalloc(PAGE_SIZE * nr_ring_pages, GFP_NOIO | __GFP_HIGH, PAGE_KERNEL);
+	rxs = __vmalloc(PAGE_SIZE * nr_ring_pages, GFP_NOIO | __GFP_HIGH, PAGE_KERNEL);
 	if (!tx_slots || !rx_slots || !txs || !rxs) {
 		xenbus_dev_fatal(dev, err, "allocating ring-related structures");
 		goto fail;
 	}
+	ring_refs = kmalloc(sizeof(ring_refs[0]) * 2 * nr_ring_pages,
+			    GFP_KERNEL);
+	if (!ring_refs) {
+		xenbus_dev_fatal(dev, err,
+				 "allocating temporary memory for connection setup");
+		goto fail;
+	}
+	for (i = 0; i < nr_ring_pages * 2; i++)
+		ring_refs[i] = GRANT_INVALID_REF;
 
 	/* A grant for every tx ring slot */
-	err = gnttab_alloc_grant_references(TX_MAX_TARGET, &gref_tx_head);
+	err = gnttab_alloc_grant_references(TX_MAX_TARGET(nr_ring_pages), &gref_tx_head);
 	if (err < 0) {
 		xenbus_dev_fatal(dev, err,
 				 "allocating %d tx grant refs",
-				 TX_MAX_TARGET);
-		goto fail;
-	}
-	/* A grant for every rx ring slot */
-	err = gnttab_alloc_grant_references(RX_MAX_TARGET, &gref_rx_head);
-	if (err < 0) {
-		xenbus_dev_fatal(dev, err,
-				 "allocating %d rx grant refs",
-				 RX_MAX_TARGET);
+				 TX_MAX_TARGET(nr_ring_pages));
 		goto fail;
 	}
 
-	err = xenbus_grant_ring(dev, virt_to_mfn(txs));
-	if (err < 0)
+	/* A grant for every rx ring slot */
+	err = gnttab_alloc_grant_references(RX_MAX_TARGET(nr_ring_pages), &gref_rx_head);
+	if (err < 0) {
+		xenbus_dev_fatal(dev, err,
+				 "allocating %d rx grant refs",
+				 RX_MAX_TARGET(nr_ring_pages));
 		goto fail;
-	tx_ring_ref = err;
-	err = xenbus_grant_ring(dev, virt_to_mfn(rxs));
-	if (err < 0)
-		goto fail;
-	rx_ring_ref = err;
+	}
+
 	err = xenbus_alloc_evtchn(dev, &evtchn);
 	if (err)
 		goto fail;
+
+	/* Grant the backend access to the rings. */
+	err = xenbus_grant_ring_virt(dev, txs, nr_ring_pages, ring_refs);
+	if (err < 0)
+		goto fail;
+	err = xenbus_grant_ring_virt(dev, rxs, nr_ring_pages,
+				     ring_refs + nr_ring_pages);
+	if (err < 0)
+		goto fail;
+
+
 	err = bind_evtchn_to_irqhandler(evtchn, xennet_interrupt,
 					0, netdev->name, netdev);
 	if (err < 0) {
@@ -1472,44 +1541,55 @@ static int setup_netfront(struct xenbus_device *dev, struct netfront_info *info)
 	/* Okay, that's all of the ways we can fail out of the way.
 	   Initialise everything and shove it in the info
 	   structure. */
-	for (i = 0; i < NET_TX_RING_SIZE; i++) {
+	for (i = 0; i < NET_TX_RING_SIZE(nr_ring_pages); i++) {
 		skb_entry_set_link(&tx_slots[i], i+1);
 		tx_slots[i].gref = GRANT_INVALID_REF;
 	}
 	info->tx_slots = tx_slots;
 	info->tx_skb_freelist = 0;
 
-	for (i = 0; i < NET_RX_RING_SIZE; i++) {
+	for (i = 0; i < NET_RX_RING_SIZE(nr_ring_pages); i++) {
 		rx_slots[i].skb = NULL;
 		rx_slots[i].gref = GRANT_INVALID_REF;
 	}
 	info->rx_slots = rx_slots;
 
 	SHARED_RING_INIT(txs);
-	FRONT_RING_INIT(&info->tx, txs, PAGE_SIZE);
+	FRONT_RING_INIT(&info->tx, txs, PAGE_SIZE * nr_ring_pages);
 
 	SHARED_RING_INIT(rxs);
-	FRONT_RING_INIT(&info->rx, rxs, PAGE_SIZE);
+	FRONT_RING_INIT(&info->rx, rxs, PAGE_SIZE * nr_ring_pages);
 
+	info->nr_ring_pages = nr_ring_pages;
+	info->multipage_ring = multipage;
+	info->rx_max_target = RX_MAX_TARGET(nr_ring_pages);
 	info->gref_tx_head = gref_tx_head;
 	info->gref_rx_head = gref_rx_head;
-	info->tx_ring_ref = tx_ring_ref;
-	info->rx_ring_ref = rx_ring_ref;
+	memcpy(info->tx_ring_refs,
+	       ring_refs,
+	       sizeof(ring_refs[0]) * nr_ring_pages);
+	memcpy(info->rx_ring_refs,
+	       ring_refs + nr_ring_pages,
+	       sizeof(ring_refs[0]) * nr_ring_pages);
 	info->evtchn = evtchn;
 	netdev->irq = irq;
+
+	kfree(ring_refs);
+
 	return 0;
 
- fail:
+fail:
 	kfree(tx_slots);
 	kfree(rx_slots);
-	if (tx_ring_ref != GRANT_INVALID_REF)
-		gnttab_end_foreign_access(tx_ring_ref, 0, (unsigned long)txs);
-	else if (txs)
-		free_page((unsigned long)txs);
-	if (rx_ring_ref != GRANT_INVALID_REF)
-		gnttab_end_foreign_access(rx_ring_ref, 0, (unsigned long)rxs);
-	else if (rxs)
-		free_page((unsigned long)rxs);
+	if (ring_refs) {
+		for (i = 0; i < nr_ring_pages * 2; i++)
+			gnttab_end_foreign_access(ring_refs[i], 0, 0);
+		kfree(ring_refs);
+	}
+	if (txs)
+		vfree(txs);
+	if (rxs)
+		vfree(rxs);
 	if (gref_tx_head != GRANT_INVALID_REF)
 		gnttab_free_grant_references(gref_tx_head);
 	if (gref_rx_head != GRANT_INVALID_REF)
@@ -1526,6 +1606,8 @@ static int talk_to_netback(struct xenbus_device *dev,
 	const char *message;
 	struct xenbus_transaction xbt;
 	int err;
+	int i;
+	char pathbuf[64];
 
 	/* Get everything into a sane state, clearing out any old ring
 	 * state which might be lying around */
@@ -1543,18 +1625,46 @@ again:
 		goto destroy_ring;
 	}
 
-	err = xenbus_printf(xbt, dev->nodename, "tx-ring-ref", "%u",
-			    info->tx_ring_ref);
-	if (err) {
-		message = "writing tx ring-ref";
-		goto abort_transaction;
+	if (info->multipage_ring) {
+		err = xenbus_printf(xbt, dev->nodename, "nr-ring-pages", "%u",
+				    info->nr_ring_pages);
+		if (err) {
+			message = "writing nr-ring-pages";
+			goto abort_transaction;
+		}
+		for (i = 0; i < info->nr_ring_pages; i++) {
+			sprintf(pathbuf, "tx-ring-ref-%d", i);
+			err = xenbus_printf(xbt, dev->nodename,
+					    pathbuf, "%u",
+					    info->tx_ring_refs[i]);
+			if (err) {
+				message = "writing tx-ring-ref";
+				goto abort_transaction;
+			}
+			sprintf(pathbuf, "rx-ring-ref-%d", i);
+			err = xenbus_printf(xbt, dev->nodename,
+					    pathbuf, "%u",
+					    info->rx_ring_refs[i]);
+			if (err) {
+				message = "writing rx-ring-ref";
+				goto abort_transaction;
+			}
+		}
+	} else {
+		err = xenbus_printf(xbt, dev->nodename, "tx-ring-ref", "%u",
+				    info->tx_ring_refs[0]);
+		if (err) {
+			message = "writing tx ring-ref";
+			goto abort_transaction;
+		}
+		err = xenbus_printf(xbt, dev->nodename, "rx-ring-ref", "%u",
+				    info->rx_ring_refs[0]);
+		if (err) {
+			message = "writing rx ring-ref";
+			goto abort_transaction;
+		}
 	}
-	err = xenbus_printf(xbt, dev->nodename, "rx-ring-ref", "%u",
-			    info->rx_ring_ref);
-	if (err) {
-		message = "writing rx ring-ref";
-		goto abort_transaction;
-	}
+
 	err = xenbus_printf(xbt, dev->nodename,
 			    "event-channel", "%u", info->evtchn);
 	if (err) {
@@ -1775,8 +1885,8 @@ static ssize_t store_rxbuf_min(struct device *dev,
 
 	if (target < RX_MIN_TARGET)
 		target = RX_MIN_TARGET;
-	if (target > RX_MAX_TARGET)
-		target = RX_MAX_TARGET;
+	if (target > RX_MAX_TARGET(np->nr_ring_pages))
+		target = RX_MAX_TARGET(np->nr_ring_pages);
 
 	spin_lock_bh(&np->rx_lock);
 	if (target > np->rx_max_target)
@@ -1818,8 +1928,8 @@ static ssize_t store_rxbuf_max(struct device *dev,
 
 	if (target < RX_MIN_TARGET)
 		target = RX_MIN_TARGET;
-	if (target > RX_MAX_TARGET)
-		target = RX_MAX_TARGET;
+	if (target > RX_MAX_TARGET(np->nr_ring_pages))
+		target = RX_MAX_TARGET(np->nr_ring_pages);
 
 	spin_lock_bh(&np->rx_lock);
 	if (target < np->rx_min_target)
