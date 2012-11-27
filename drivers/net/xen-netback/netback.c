@@ -1600,8 +1600,9 @@ void xen_netbk_unmap_frontend_rings(struct xenvif *vif)
 }
 
 int xen_netbk_map_frontend_rings(struct xenvif *vif,
-				 grant_ref_t tx_ring_ref,
-				 grant_ref_t rx_ring_ref)
+				 const grant_ref_t *tx_ring_refs,
+				 const grant_ref_t *rx_ring_refs,
+				 unsigned nr_ring_pages)
 {
 	void *addr;
 	struct xen_netif_tx_sring *txs;
@@ -1609,21 +1610,25 @@ int xen_netbk_map_frontend_rings(struct xenvif *vif,
 
 	int err = -ENOMEM;
 
-	err = xenbus_map_ring_valloc(xenvif_to_xenbus_device(vif),
-				     tx_ring_ref, &addr);
+	err = xenbus_map_ring_valloc_n(xenvif_to_xenbus_device(vif),
+				       tx_ring_refs,
+				       nr_ring_pages,
+				       &addr);
 	if (err)
 		goto err;
 
 	txs = (struct xen_netif_tx_sring *)addr;
-	BACK_RING_INIT(&vif->tx, txs, PAGE_SIZE);
+	BACK_RING_INIT(&vif->tx, txs, PAGE_SIZE * nr_ring_pages);
 
-	err = xenbus_map_ring_valloc(xenvif_to_xenbus_device(vif),
-				     rx_ring_ref, &addr);
+	err = xenbus_map_ring_valloc_n(xenvif_to_xenbus_device(vif),
+				       rx_ring_refs,
+				       nr_ring_pages,
+				       &addr);
 	if (err)
 		goto err;
 
 	rxs = (struct xen_netif_rx_sring *)addr;
-	BACK_RING_INIT(&vif->rx, rxs, PAGE_SIZE);
+	BACK_RING_INIT(&vif->rx, rxs, PAGE_SIZE * nr_ring_pages);
 
 	vif->rx_req_cons_peek = 0;
 

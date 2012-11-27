@@ -88,6 +88,13 @@ static int netback_probe(struct xenbus_device *dev,
 			goto abort_transaction;
 		}
 
+		err = xenbus_printf(xbt, dev->nodename, "feature-max-ring-pages",
+				    "%d", xen_pv_domain() ? MAX_PAGES_PER_RING : 1);
+		if (err) {
+			message = "writing feature-max-ring-pages";
+			goto abort_transaction;
+		}
+
 		err = xenbus_printf(xbt, dev->nodename, "feature-gso-tcpv4",
 				    "%d", sg);
 		if (err) {
@@ -392,20 +399,73 @@ static int connect_rings(struct backend_info *be)
 {
 	struct xenvif *vif = be->vif;
 	struct xenbus_device *dev = be->dev;
-	unsigned long tx_ring_ref, rx_ring_ref;
-	unsigned int evtchn, rx_copy;
+	grant_ref_t tx_ring_refs[MAX_PAGES_PER_RING], rx_ring_refs[MAX_PAGES_PER_RING];
+	unsigned int evtchn, rx_copy, nr_ring_pages;
+	unsigned multipage;
+	int i;
 	int err;
 	int val;
+	char pathbuf[64];
 
-	err = xenbus_gather(XBT_NIL, dev->otherend,
-			    "tx-ring-ref", "%lu", &tx_ring_ref,
-			    "rx-ring-ref", "%lu", &rx_ring_ref,
-			    "event-channel", "%u", &evtchn, NULL);
-	if (err) {
-		xenbus_dev_fatal(dev, err,
-				 "reading %s/ring-ref and event-channel",
+	err = xenbus_scanf(XBT_NIL, dev->otherend, "nr-ring-pages", "%u",
+			   &nr_ring_pages);
+	if (err == -ENOENT) {
+		err = 0;
+		nr_ring_pages = 1;
+		multipage = 0;
+	} else {
+		multipage = 1;
+	}
+	if (err < 0) {
+		xenbus_dev_fatal(dev, err, "reading %s/nr-ring-pages",
 				 dev->otherend);
 		return err;
+	}
+	if (nr_ring_pages < 1 ||
+	    nr_ring_pages > MAX_PAGES_PER_RING ||
+	    (!xen_pv_domain() && nr_ring_pages > 1) ||
+	    (nr_ring_pages & (nr_ring_pages - 1))) {
+		xenbus_dev_fatal(dev,
+				 err,
+				 "error in %s/nr-ring-pages: should be a power of two between 1 and %d, was %u",
+				 dev->otherend,
+				 xen_pv_domain() ? MAX_PAGES_PER_RING : 1, nr_ring_pages);
+		return -EINVAL;
+	}
+	vif->nr_ring_pages = nr_ring_pages;
+
+	err = xenbus_scanf(XBT_NIL, dev->otherend, "event-channel", "%u", &evtchn);
+	if (err < 0) {
+		xenbus_dev_fatal(dev, err, "reading %s/event-channel", dev->otherend);
+		return err;
+	}
+
+	if (multipage) {
+		for (i = 0; i < nr_ring_pages; i++) {
+			sprintf(pathbuf, "tx-ring-ref-%d", i);
+			err = xenbus_scanf(XBT_NIL, dev->otherend, pathbuf, "%u", &tx_ring_refs[i]);
+			if (err < 0) {
+				xenbus_dev_fatal(dev, err, "reading %s/%s", dev->otherend, pathbuf);
+				return err;
+			}
+			sprintf(pathbuf, "rx-ring-ref-%d", i);
+			err = xenbus_scanf(XBT_NIL, dev->otherend, pathbuf, "%u", &rx_ring_refs[i]);
+			if (err < 0) {
+				xenbus_dev_fatal(dev, err, "reading %s/%s", dev->otherend, pathbuf);
+				return err;
+			}
+		}
+	} else {
+		err = xenbus_gather(XBT_NIL, dev->otherend,
+				    "tx-ring-ref", "%lu", &tx_ring_refs[0],
+				    "rx-ring-ref", "%lu", &rx_ring_refs[0],
+				    NULL);
+		if (err) {
+			xenbus_dev_fatal(dev, err,
+					 "reading %s/ring-refs",
+					 dev->otherend);
+			return err;
+		}
 	}
 
 	err = xenbus_scanf(XBT_NIL, dev->otherend, "request-rx-copy", "%u",
@@ -454,11 +514,11 @@ static int connect_rings(struct backend_info *be)
 	vif->csum = !val;
 
 	/* Map the shared frame, irq etc. */
-	err = xenvif_connect(vif, tx_ring_ref, rx_ring_ref, evtchn);
+	err = xenvif_connect(vif, tx_ring_refs, rx_ring_refs, evtchn, nr_ring_pages);
 	if (err) {
 		xenbus_dev_fatal(dev, err,
-				 "mapping shared-frames %lu/%lu port %u",
-				 tx_ring_ref, rx_ring_ref, evtchn);
+				 "mapping shared-frames %u/%u port %u",
+				 tx_ring_refs[0], rx_ring_refs[0], evtchn);
 		return err;
 	}
 	return 0;

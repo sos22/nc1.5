@@ -304,8 +304,11 @@ struct xenvif *xenvif_alloc(struct device *parent, domid_t domid,
 	return vif;
 }
 
-int xenvif_connect(struct xenvif *vif, unsigned long tx_ring_ref,
-		   unsigned long rx_ring_ref, unsigned int evtchn)
+int xenvif_connect(struct xenvif *vif,
+		   const grant_ref_t *tx_ring_refs,
+		   const grant_ref_t *rx_ring_refs,
+		   unsigned int evtchn,
+		   unsigned nr_ring_pages)
 {
 	int err = -ENOMEM;
 
@@ -313,7 +316,7 @@ int xenvif_connect(struct xenvif *vif, unsigned long tx_ring_ref,
 	if (vif->irq)
 		return 0;
 
-	err = xen_netbk_map_frontend_rings(vif, tx_ring_ref, rx_ring_ref);
+	err = xen_netbk_map_frontend_rings(vif, tx_ring_refs, rx_ring_refs, nr_ring_pages);
 	if (err < 0)
 		goto err;
 

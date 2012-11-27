@@ -45,6 +45,8 @@
 #include <xen/grant_table.h>
 #include <xen/xenbus.h>
 
+#define MAX_PAGES_PER_RING 4
+
 struct xen_netbk;
 
 struct xenvif {
@@ -59,6 +61,8 @@ struct xenvif {
 
 	/* Physical parameters of the comms window. */
 	unsigned int     irq;
+
+	unsigned nr_ring_pages;
 
 	/* List of frontends to notify after a batch of frames sent. */
 	struct list_head notify_list;
@@ -109,8 +113,9 @@ struct xenvif *xenvif_alloc(struct device *parent,
 			    domid_t domid,
 			    unsigned int handle);
 
-int xenvif_connect(struct xenvif *vif, unsigned long tx_ring_ref,
-		   unsigned long rx_ring_ref, unsigned int evtchn);
+int xenvif_connect(struct xenvif *vif, const grant_ref_t *tx_ring_refs,
+		   const grant_ref_t *rx_ring_refs, unsigned int evtchn,
+		   unsigned nr_ring_pages);
 void xenvif_disconnect(struct xenvif *vif);
 
 void xenvif_get(struct xenvif *vif);
@@ -127,8 +132,9 @@ int xen_netbk_must_stop_queue(struct xenvif *vif);
 /* (Un)Map communication rings. */
 void xen_netbk_unmap_frontend_rings(struct xenvif *vif);
 int xen_netbk_map_frontend_rings(struct xenvif *vif,
-				 grant_ref_t tx_ring_ref,
-				 grant_ref_t rx_ring_ref);
+				 const grant_ref_t *tx_ring_refs,
+				 const grant_ref_t *rx_ring_ref,
+				 unsigned nr_grefs);
 
 /* (De)Register a xenvif with the netback backend. */
 void xen_netbk_add_xenvif(struct xenvif *vif);
