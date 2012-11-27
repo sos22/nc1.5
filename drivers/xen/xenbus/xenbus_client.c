@@ -47,12 +47,16 @@
 
 #include "xenbus_probe.h"
 
-struct xenbus_map_node {
+struct xenbus_map_node_pv {
 	struct list_head next;
-	union {
-		struct vm_struct *area; /* PV */
-		struct page *page;     /* HVM */
-	};
+	unsigned nr_pages;
+	struct vm_struct *area;
+	grant_handle_t handles[0];
+};
+
+struct xenbus_map_node_hvm {
+	struct list_head next;
+	struct page *page;
 	grant_handle_t handle;
 };
 
@@ -60,7 +64,7 @@ static DEFINE_SPINLOCK(xenbus_valloc_lock);
 static LIST_HEAD(xenbus_valloc_pages);
 
 struct xenbus_ring_ops {
-	int (*map)(struct xenbus_device *dev, int gnt, void **vaddr);
+	int (*map)(struct xenbus_device *dev, const grant_ref_t *gnt, unsigned nr_grefs, void **vaddr);
 	int (*unmap)(struct xenbus_device *dev, void *vaddr);
 };
 
@@ -513,52 +517,80 @@ EXPORT_SYMBOL_GPL(xenbus_free_evtchn);
  * or -ENOMEM on error. If an error is returned, device will switch to
  * XenbusStateClosing and the error message will be saved in XenStore.
  */
-int xenbus_map_ring_valloc(struct xenbus_device *dev, int gnt_ref, void **vaddr)
+int xenbus_map_ring_valloc(struct xenbus_device *dev, grant_ref_t gnt_ref, void **vaddr)
 {
-	return ring_ops->map(dev, gnt_ref, vaddr);
+	return ring_ops->map(dev, &gnt_ref, 1, vaddr);
 }
 EXPORT_SYMBOL_GPL(xenbus_map_ring_valloc);
 
-static int xenbus_map_ring_valloc_pv(struct xenbus_device *dev,
-				     int gnt_ref, void **vaddr)
+/**
+ * xenbus_map_ring_valloc_n
+ * @dev: xenbus device
+ * @gnt_refs: grant references to map
+ * @nr_grefs: number of entries in @gnt_refs array
+ * @vaddr: filled out by address of mapping
+ *
+ * Map a list of @nr_grefs grant references into this domain's page
+ * tables.  The resulting mappings are virtually contiguous, but may
+ * not be (and in fact probably aren't) physically or machine
+ * contiguous.  Returns 0 on success and GNTST_* or -errno on error.
+ * If an error is returned the device will switch to
+ * XenbusStateClosing and the error message will be saved in XenStore.
+ *
+ * Note that error returns may be positive or negative.  Any non-zero
+ * value is an error.
+ */
+int xenbus_map_ring_valloc_n(struct xenbus_device *dev, const grant_ref_t *gnt_refs, unsigned nr_grefs, void **vaddr)
 {
-	struct gnttab_map_grant_ref op = {
-		.flags = GNTMAP_host_map | GNTMAP_contains_pte,
-		.ref   = gnt_ref,
-		.dom   = dev->otherend_id,
-	};
-	struct xenbus_map_node *node;
+	return ring_ops->map(dev, gnt_refs, nr_grefs, vaddr);
+}
+EXPORT_SYMBOL_GPL(xenbus_map_ring_valloc_n);
+
+static int xenbus_map_ring_valloc_pv(struct xenbus_device *dev,
+				     const grant_ref_t *gnt_refs,
+				     unsigned nr_grefs,
+				     void **vaddr)
+{
+	struct gnttab_map_grant_ref map_op;
+	struct gnttab_unmap_grant_ref unmap_op;
+	struct xenbus_map_node_pv *node;
 	struct vm_struct *area;
-	pte_t *pte;
+	pte_t **ptes;
+	int i;
 
 	*vaddr = NULL;
 
-	node = kzalloc(sizeof(*node), GFP_KERNEL);
-	if (!node)
-		return -ENOMEM;
-
-	area = alloc_vm_area(PAGE_SIZE, &pte);
-	if (!area) {
+	ptes = kzalloc(sizeof(pte_t) * nr_grefs, GFP_KERNEL);
+	node = kzalloc(sizeof(*node) + sizeof(grant_handle_t) * nr_grefs, GFP_KERNEL);
+	area = alloc_vm_area(PAGE_SIZE * nr_grefs, ptes);
+	if (!ptes || !node || !area) {
+		kfree(ptes);
 		kfree(node);
+		if (area)
+			free_vm_area(area);
+		xenbus_dev_fatal(dev, -ENOMEM,
+				 "allocating memory to map %d shared pages from domain %d",
+				 nr_grefs, dev->otherend_id);
 		return -ENOMEM;
 	}
 
-	op.host_addr = arbitrary_virt_to_machine(pte).maddr;
-
-	if (HYPERVISOR_grant_table_op(GNTTABOP_map_grant_ref, &op, 1))
-		BUG();
-
-	if (op.status != GNTST_okay) {
-		free_vm_area(area);
-		kfree(node);
-		xenbus_dev_fatal(dev, op.status,
-				 "mapping in shared page %d from domain %d",
-				 gnt_ref, dev->otherend_id);
-		return op.status;
-	}
-
-	node->handle = op.handle;
+	node->nr_pages = nr_grefs;
 	node->area = area;
+
+	memset(&map_op, 0, sizeof(map_op));
+	map_op.dom = dev->otherend_id;
+	map_op.flags = GNTMAP_host_map | GNTMAP_contains_pte;
+	for (i = 0; i < nr_grefs; i++) {
+		map_op.ref = gnt_refs[i];
+		map_op.host_addr = arbitrary_virt_to_machine(ptes[i]).maddr;
+		if (HYPERVISOR_grant_table_op(GNTTABOP_map_grant_ref, &map_op, 1))
+			BUG();
+		if (map_op.status != GNTST_okay)
+			goto err;
+		node->handles[i] = map_op.handle;
+	}
+
+	kfree(ptes);
 
 	spin_lock(&xenbus_valloc_lock);
 	list_add(&node->next, &xenbus_valloc_pages);
@@ -566,28 +598,55 @@ static int xenbus_map_ring_valloc_pv(struct xenbus_device *dev,
 
 	*vaddr = area->addr;
 	return 0;
+
+err:
+	xenbus_dev_fatal(dev, map_op.status,
+			 "mapping in shared page %d (%d/%d)from domain %d",
+			 gnt_refs[i], i, nr_grefs, dev->otherend_id);
+	memset(&unmap_op, 0, sizeof(unmap_op));
+	for (i--; i >= 0; i--) {
+		unsigned long vaddr = (unsigned long)area + i * PAGE_SIZE;
+		unsigned level;
+
+		unmap_op.handle = node->handles[i];
+		unmap_op.host_addr = arbitrary_virt_to_machine(
+			lookup_address(vaddr, &level)).maddr;
+		if (HYPERVISOR_grant_table_op(GNTTABOP_unmap_grant_ref, &unmap_op, 1))
+			BUG();
+		BUG_ON(unmap_op.status != GNTST_okay);
+	}
+	kfree(ptes);
+	free_vm_area(area);
+	kfree(node);
+	return map_op.status;
 }
 
 static int xenbus_map_ring_valloc_hvm(struct xenbus_device *dev,
-				      int gnt_ref, void **vaddr)
+				      const grant_ref_t *gnt_refs,
+				      unsigned nr_grefs,
+				      void **vaddr)
 {
-	struct xenbus_map_node *node;
+	struct xenbus_map_node_hvm *node;
 	int err;
+	int i;
 	void *addr;
 
 	*vaddr = NULL;
+
+	if (nr_grefs > 1)
+		return -EOPNOTSUPP;
 
 	node = kzalloc(sizeof(*node), GFP_KERNEL);
 	if (!node)
 		return -ENOMEM;
 
-	err = alloc_xenballooned_pages(1, &node->page, false /* lowmem */);
+	i = 0;
+	err = alloc_xenballooned_pages(nr_grefs, &node->page, false /* lowmem */);
 	if (err)
 		goto out_err;
 
 	addr = pfn_to_kaddr(page_to_pfn(node->page));
-
-	err = xenbus_map_ring(dev, gnt_ref, &node->handle, addr);
+	err = xenbus_map_ring(dev, gnt_refs[0], &node->handle, addr);
 	if (err)
 		goto out_err;
 
@@ -599,7 +658,7 @@ static int xenbus_map_ring_valloc_hvm(struct xenbus_device *dev,
 	return 0;
 
  out_err:
-	free_xenballooned_pages(1, &node->page);
+	free_xenballooned_pages(nr_grefs, &node->page);
 	kfree(node);
 	return err;
 }
@@ -662,11 +721,11 @@ EXPORT_SYMBOL_GPL(xenbus_unmap_ring_vfree);
 
 static int xenbus_unmap_ring_vfree_pv(struct xenbus_device *dev, void *vaddr)
 {
-	struct xenbus_map_node *node;
-	struct gnttab_unmap_grant_ref op = {
-		.host_addr = (unsigned long)vaddr,
-	};
+	struct xenbus_map_node_pv *node;
+	struct gnttab_unmap_grant_ref op;
 	unsigned int level;
+	int failed;
+	int i;
 
 	spin_lock(&xenbus_valloc_lock);
 	list_for_each_entry(node, &xenbus_valloc_pages, next) {
@@ -685,19 +744,33 @@ static int xenbus_unmap_ring_vfree_pv(struct xenbus_device *dev, void *vaddr)
 		return GNTST_bad_virt_addr;
 	}
 
-	op.handle = node->handle;
-	op.host_addr = arbitrary_virt_to_machine(
-		lookup_address((unsigned long)vaddr, &level)).maddr;
+	failed = 0;
 
-	if (HYPERVISOR_grant_table_op(GNTTABOP_unmap_grant_ref, &op, 1))
-		BUG();
+	memset(&op, 0, sizeof(op));
+	for (i = 0; i < node->nr_pages; i++) {
+		op.handle = node->handles[i];
+		op.host_addr = arbitrary_virt_to_machine(
+			lookup_address((unsigned long)vaddr + i * PAGE_SIZE, &level)).maddr;
+		if (HYPERVISOR_grant_table_op(GNTTABOP_unmap_grant_ref, &op, 1))
+			BUG();
 
-	if (op.status == GNTST_okay)
+		if (op.status != GNTST_okay) {
+			if (!failed)
+				xenbus_dev_error(dev, op.status,
+						 "unmapping page at handle %d (%d/%d) error %d",
+						 node->handles[i], i, node->nr_pages, op.status);
+			/* Might as well try and unmap the other
+			   pages, even if the whole thing is going to
+			   fail. */
+			/* XXX there's a pretty strong argument that
+			 * this should BUG() */
+			failed = 1;
+		}
+	}
+	/* If the unmap failed then we just leak the virtual address
+	 * space. */
+	if (!failed)
 		free_vm_area(node->area);
-	else
-		xenbus_dev_error(dev, op.status,
-				 "unmapping page at handle %d error %d",
-				 node->handle, op.status);
 
 	kfree(node);
 	return op.status;
@@ -706,7 +779,7 @@ static int xenbus_unmap_ring_vfree_pv(struct xenbus_device *dev, void *vaddr)
 static int xenbus_unmap_ring_vfree_hvm(struct xenbus_device *dev, void *vaddr)
 {
 	int rv;
-	struct xenbus_map_node *node;
+	struct xenbus_map_node_hvm *node;
 	void *addr;
 
 	spin_lock(&xenbus_valloc_lock);

@@ -201,7 +201,12 @@ int xenbus_grant_ring_virt(struct xenbus_device *dev,
 			   unsigned nr_pages,
 			   grant_ref_t *grefs);
 int xenbus_map_ring_valloc(struct xenbus_device *dev,
-			   int gnt_ref, void **vaddr);
+			   grant_ref_t gnt_ref,
+			   void **vaddr);
+int xenbus_map_ring_valloc_n(struct xenbus_device *dev,
+			     const grant_ref_t *gnt_ref,
+			     unsigned nr_grefs,
+			     void **vaddr);
 int xenbus_map_ring(struct xenbus_device *dev, int gnt_ref,
 			   grant_handle_t *handle, void *vaddr);
 
