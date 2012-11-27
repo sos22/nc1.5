@@ -371,6 +371,61 @@ int xenbus_grant_ring(struct xenbus_device *dev, unsigned long ring_mfn)
 }
 EXPORT_SYMBOL_GPL(xenbus_grant_ring);
 
+/**
+ * xenbus_grant_ring_virt
+ * @dev: xenbus device
+ * @virt: virtual address of buffer to grant
+ * @nr_pages: number of pages starting at @virt to grant
+ * @grefs: a pointer to an array of @nr_pages grant references which gets
+ *         filled out with resulting references.
+ *
+ * Grant access to a block of pages, identified by a contiguous range
+ * of virtual addresses, to the peer of a given device.  Return 0 on
+ * success or -errno on error.  On error, the device will switch to
+ * XenbusStateClosing and the error will be saved in the store.
+ *
+ * Note that access is granted to machine memory, rather than to
+ * virtual memory; the virtual address is just used to find the pages
+ * i.e. chaning the page tables after calling this will have to effect
+ * on which pages the remote domain can access.
+ *
+ * The pages to be granted must be contiguous in virtual memory but do
+ * not have to be contiguous in physical or machine memory.
+ */
+int xenbus_grant_ring_virt(struct xenbus_device *dev,
+			   void *virt,
+			   unsigned nr_pages,
+			   grant_ref_t *grefs)
+{
+	grant_ref_t headref;
+	int r;
+	int i;
+
+	BUG_ON(nr_pages != (u16)nr_pages);
+	BUG_ON( (unsigned long)virt & ~PAGE_MASK );
+	memset(grefs, 0, sizeof(grant_ref_t) * nr_pages);
+	r = gnttab_alloc_grant_references(nr_pages, &headref);
+	if (r < 0) {
+		xenbus_dev_fatal(dev, r,
+				 "allocating grant %d references for ring", nr_pages);
+		return r;
+	}
+	for (i = 0; i < nr_pages; i++) {
+		int ref_int;
+		grant_ref_t ref;
+		ref_int = gnttab_claim_grant_reference(&headref);
+		BUG_ON(ref_int < 0);
+		ref = (grant_ref_t)ref_int;
+		gnttab_grant_foreign_access_ref(
+			ref,
+			dev->otherend_id,
+			arbitrary_virt_to_mfn(virt + i * PAGE_SIZE),
+			0);
+		grefs[i] = ref;
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(xenbus_grant_ring_virt);
 
 /**
  * Allocate an event channel for the given xenbus_device, assigning the newly

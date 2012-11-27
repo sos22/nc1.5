@@ -196,6 +196,10 @@ int xenbus_watch_pathfmt(struct xenbus_device *dev, struct xenbus_watch *watch,
 
 int xenbus_switch_state(struct xenbus_device *dev, enum xenbus_state new_state);
 int xenbus_grant_ring(struct xenbus_device *dev, unsigned long ring_mfn);
+int xenbus_grant_ring_virt(struct xenbus_device *dev,
+			   void *virt,
+			   unsigned nr_pages,
+			   grant_ref_t *grefs);
 int xenbus_map_ring_valloc(struct xenbus_device *dev,
 			   int gnt_ref, void **vaddr);
 int xenbus_map_ring(struct xenbus_device *dev, int gnt_ref,
