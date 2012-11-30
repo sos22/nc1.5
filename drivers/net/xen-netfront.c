@@ -132,11 +132,13 @@ struct netfront_info {
 	 *  greater than PAGE_OFFSET: we use this property to distinguish
 	 *  them.
 	 */
-	union skb_entry {
-		struct sk_buff *skb;
-		unsigned long link;
-	} tx_skbs[NET_TX_RING_SIZE];
-	grant_ref_t grant_tx_ref[NET_TX_RING_SIZE];
+	struct tx_slot {
+		union {
+			struct sk_buff *skb;
+			unsigned long link;
+		};
+		grant_ref_t gref;
+	} tx_slots[NET_TX_RING_SIZE];
 
 	/* Receive-ring batched refills. */
 #define RX_MIN_TARGET 8
@@ -153,12 +155,12 @@ struct netfront_rx_info {
 	struct xen_netif_extra_info extras[XEN_NETIF_EXTRA_TYPE_MAX - 1];
 };
 
-static void skb_entry_set_link(union skb_entry *list, unsigned short id)
+static void skb_entry_set_link(struct tx_slot *list, unsigned short id)
 {
 	list->link = id;
 }
 
-static int skb_entry_is_link(const union skb_entry *list)
+static int skb_entry_is_link(const struct tx_slot *list)
 {
 	BUILD_BUG_ON(sizeof(list->skb) != sizeof(list->link));
 	return (unsigned long)list->skb < PAGE_OFFSET;
@@ -168,7 +170,7 @@ static int skb_entry_is_link(const union skb_entry *list)
  * Access macros for acquiring freeing slots in tx_skbs[].
  */
 
-static void add_id_to_freelist(unsigned *head, union skb_entry *list,
+static void add_id_to_freelist(unsigned *head, struct tx_slot *list,
 			       unsigned short id)
 {
 	skb_entry_set_link(&list[id], *head);
@@ -176,7 +178,7 @@ static void add_id_to_freelist(unsigned *head, union skb_entry *list,
 }
 
 static unsigned short get_id_from_freelist(unsigned *head,
-					   union skb_entry *list)
+					   struct tx_slot *list)
 {
 	unsigned int id = *head;
 	*head = list[id].link;
@@ -386,20 +388,20 @@ static void xennet_tx_buf_gc(struct net_device *dev)
 				continue;
 
 			id  = txrsp->id;
-			skb = np->tx_skbs[id].skb;
+			skb = np->tx_slots[id].skb;
 			if (unlikely(gnttab_query_foreign_access(
-				np->grant_tx_ref[id]) != 0)) {
+				np->tx_slots[id].gref) != 0)) {
 				printk(KERN_ALERT "xennet_tx_buf_gc: warning "
 				       "-- grant still in use by backend "
 				       "domain.\n");
 				BUG();
 			}
 			gnttab_end_foreign_access_ref(
-				np->grant_tx_ref[id], GNTMAP_readonly);
+				np->tx_slots[id].gref, GNTMAP_readonly);
 			gnttab_release_grant_reference(
-				&np->gref_tx_head, np->grant_tx_ref[id]);
-			np->grant_tx_ref[id] = GRANT_INVALID_REF;
-			add_id_to_freelist(&np->tx_skb_freelist, np->tx_skbs, id);
+				&np->gref_tx_head, np->tx_slots[id].gref);
+			np->tx_slots[id].gref = GRANT_INVALID_REF;
+			add_id_to_freelist(&np->tx_skb_freelist, np->tx_slots, id);
 			dev_kfree_skb_irq(skb);
 		}
 
@@ -444,8 +446,8 @@ static void xennet_make_frags(struct sk_buff *skb, struct net_device *dev,
 		data += tx->size;
 		offset = 0;
 
-		id = get_id_from_freelist(&np->tx_skb_freelist, np->tx_skbs);
-		np->tx_skbs[id].skb = skb_get(skb);
+		id = get_id_from_freelist(&np->tx_skb_freelist, np->tx_slots);
+		np->tx_slots[id].skb = skb_get(skb);
 		tx = RING_GET_REQUEST(&np->tx, prod++);
 		tx->id = id;
 		ref = gnttab_claim_grant_reference(&np->gref_tx_head);
@@ -455,7 +457,7 @@ static void xennet_make_frags(struct sk_buff *skb, struct net_device *dev,
 		gnttab_grant_foreign_access_ref(ref, np->xbdev->otherend_id,
 						mfn, GNTMAP_readonly);
 
-		tx->gref = np->grant_tx_ref[id] = ref;
+		tx->gref = np->tx_slots[id].gref = ref;
 		tx->offset = offset;
 		tx->size = len;
 		tx->flags = 0;
@@ -467,8 +469,8 @@ static void xennet_make_frags(struct sk_buff *skb, struct net_device *dev,
 
 		tx->flags |= XEN_NETTXF_more_data;
 
-		id = get_id_from_freelist(&np->tx_skb_freelist, np->tx_skbs);
-		np->tx_skbs[id].skb = skb_get(skb);
+		id = get_id_from_freelist(&np->tx_skb_freelist, np->tx_slots);
+		np->tx_slots[id].skb = skb_get(skb);
 		tx = RING_GET_REQUEST(&np->tx, prod++);
 		tx->id = id;
 		ref = gnttab_claim_grant_reference(&np->gref_tx_head);
@@ -478,7 +480,7 @@ static void xennet_make_frags(struct sk_buff *skb, struct net_device *dev,
 		gnttab_grant_foreign_access_ref(ref, np->xbdev->otherend_id,
 						mfn, GNTMAP_readonly);
 
-		tx->gref = np->grant_tx_ref[id] = ref;
+		tx->gref = np->tx_slots[id].gref = ref;
 		tx->offset = frag->page_offset;
 		tx->size = skb_frag_size(frag);
 		tx->flags = 0;
@@ -523,8 +525,8 @@ static int xennet_start_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	i = np->tx.req_prod_pvt;
 
-	id = get_id_from_freelist(&np->tx_skb_freelist, np->tx_skbs);
-	np->tx_skbs[id].skb = skb;
+	id = get_id_from_freelist(&np->tx_skb_freelist, np->tx_slots);
+	np->tx_slots[id].skb = skb;
 
 	tx = RING_GET_REQUEST(&np->tx, i);
 
@@ -534,7 +536,7 @@ static int xennet_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	mfn = virt_to_mfn(data);
 	gnttab_grant_foreign_access_ref(
 		ref, np->xbdev->otherend_id, mfn, GNTMAP_readonly);
-	tx->gref = np->grant_tx_ref[id] = ref;
+	tx->gref = np->tx_slots[id].gref = ref;
 	tx->offset = offset;
 	tx->size = len;
 	extra = NULL;
@@ -1086,16 +1088,16 @@ static void xennet_release_tx_bufs(struct netfront_info *np)
 
 	for (i = 0; i < NET_TX_RING_SIZE; i++) {
 		/* Skip over entries which are actually freelist references */
-		if (skb_entry_is_link(&np->tx_skbs[i]))
+		if (skb_entry_is_link(&np->tx_slots[i]))
 			continue;
 
-		skb = np->tx_skbs[i].skb;
-		gnttab_end_foreign_access_ref(np->grant_tx_ref[i],
+		skb = np->tx_slots[i].skb;
+		gnttab_end_foreign_access_ref(np->tx_slots[i].gref,
 					      GNTMAP_readonly);
 		gnttab_release_grant_reference(&np->gref_tx_head,
-					       np->grant_tx_ref[i]);
-		np->grant_tx_ref[i] = GRANT_INVALID_REF;
-		add_id_to_freelist(&np->tx_skb_freelist, np->tx_skbs, i);
+					       np->tx_slots[i].gref);
+		np->tx_slots[i].gref = GRANT_INVALID_REF;
+		add_id_to_freelist(&np->tx_skb_freelist, np->tx_slots, i);
 		dev_kfree_skb_irq(skb);
 	}
 }
@@ -1222,8 +1224,8 @@ static struct net_device * __devinit xennet_create_dev(struct xenbus_device *dev
 	/* Initialise tx_skbs as a free chain containing every entry. */
 	np->tx_skb_freelist = 0;
 	for (i = 0; i < NET_TX_RING_SIZE; i++) {
-		skb_entry_set_link(&np->tx_skbs[i], i+1);
-		np->grant_tx_ref[i] = GRANT_INVALID_REF;
+		skb_entry_set_link(&np->tx_slots[i], i+1);
+		np->tx_slots[i].gref = GRANT_INVALID_REF;
 	}
 
 	/* Clear out rx_skbs */
