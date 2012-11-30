@@ -69,6 +69,9 @@ struct netfront_cb {
 #define NET_TX_RING_SIZE __CONST_RING_SIZE(xen_netif_tx, PAGE_SIZE)
 #define NET_RX_RING_SIZE __CONST_RING_SIZE(xen_netif_rx, PAGE_SIZE)
 #define TX_MAX_TARGET min_t(int, NET_TX_RING_SIZE, 256)
+#define RX_MIN_TARGET 8
+#define RX_DFL_MIN_TARGET 64
+#define RX_MAX_TARGET min_t(int, NET_RX_RING_SIZE, 256)
 
 struct netfront_stats {
 	u64			rx_packets;
@@ -79,21 +82,16 @@ struct netfront_stats {
 };
 
 struct netfront_info {
-	/* XXX the hotpath needs to access xbdev->otherend_id, and
-	   only that field.  Might be worth caching it here. */
-
 	/* Stuff accessed by TX, in the order it gets accessed, in the
 	   vague hope that that'll make the cache less thrashed.  */
 	struct netfront_stats __percpu *stats;
-	spinlock_t   tx_lock;
-	/* Two bytes padding here */
+	spinlock_t tx_lock;
+	domid_t otherend_id;
 	unsigned tx_skb_freelist;
 	struct xen_netif_tx_front_ring tx;
 	grant_ref_t gref_tx_head;
 	/* Four bytes padding here */
-	struct xenbus_device *xbdev;
 	struct net_device *netdev;
-	/* This is offset 64 bytes, which is usually a single cache line */
 
 	/* Now do the same for the receive side.  Receive also needs
 	   to pull in quite a lot of the TX cache line, but there's
@@ -117,6 +115,7 @@ struct netfront_info {
 
 	/* Various bits of metadata which are only used for setup and
 	 * teardown. */
+	struct xenbus_device *xbdev;
 	unsigned int evtchn;
 	int tx_ring_ref;
 	int rx_ring_ref;
@@ -139,12 +138,6 @@ struct netfront_info {
 		};
 		grant_ref_t gref;
 	} tx_slots[NET_TX_RING_SIZE];
-
-	/* Receive-ring batched refills. */
-#define RX_MIN_TARGET 8
-#define RX_DFL_MIN_TARGET 64
-#define RX_MAX_TARGET min_t(int, NET_RX_RING_SIZE, 256)
-
 	struct rx_slot {
 		struct sk_buff *skb;
 		grant_ref_t gref;
@@ -330,7 +323,7 @@ no_skb:
 
 		req = RING_GET_REQUEST(&np->rx, req_prod + i);
 		gnttab_grant_foreign_access_ref(ref,
-						np->xbdev->otherend_id,
+						np->otherend_id,
 						pfn_to_mfn(pfn),
 						0);
 
@@ -455,7 +448,7 @@ static void xennet_make_frags(struct sk_buff *skb, struct net_device *dev,
 		BUG_ON((signed short)ref < 0);
 
 		mfn = virt_to_mfn(data);
-		gnttab_grant_foreign_access_ref(ref, np->xbdev->otherend_id,
+		gnttab_grant_foreign_access_ref(ref, np->otherend_id,
 						mfn, GNTMAP_readonly);
 
 		tx->gref = np->tx_slots[id].gref = ref;
@@ -478,7 +471,7 @@ static void xennet_make_frags(struct sk_buff *skb, struct net_device *dev,
 		BUG_ON((signed short)ref < 0);
 
 		mfn = pfn_to_mfn(page_to_pfn(skb_frag_page(frag)));
-		gnttab_grant_foreign_access_ref(ref, np->xbdev->otherend_id,
+		gnttab_grant_foreign_access_ref(ref, np->otherend_id,
 						mfn, GNTMAP_readonly);
 
 		tx->gref = np->tx_slots[id].gref = ref;
@@ -536,7 +529,7 @@ static int xennet_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	BUG_ON((signed short)ref < 0);
 	mfn = virt_to_mfn(data);
 	gnttab_grant_foreign_access_ref(
-		ref, np->xbdev->otherend_id, mfn, GNTMAP_readonly);
+		ref, np->otherend_id, mfn, GNTMAP_readonly);
 	tx->gref = np->tx_slots[id].gref = ref;
 	tx->offset = offset;
 	tx->size = len;
@@ -1204,6 +1197,7 @@ static struct net_device * __devinit xennet_create_dev(struct xenbus_device *dev
 
 	np                   = netdev_priv(netdev);
 	np->xbdev            = dev;
+	np->otherend_id      = dev->otherend_id;
 
 	spin_lock_init(&np->tx_lock);
 	spin_lock_init(&np->rx_lock);
@@ -1593,7 +1587,7 @@ static int xennet_connect(struct net_device *dev)
 		frag = &skb_shinfo(skb)->frags[0];
 		page = skb_frag_page(frag);
 		gnttab_grant_foreign_access_ref(
-			ref, np->xbdev->otherend_id,
+			ref, np->otherend_id,
 			pfn_to_mfn(page_to_pfn(page)),
 			0);
 		req->gref = ref;
@@ -1629,6 +1623,8 @@ static void netback_changed(struct xenbus_device *dev,
 {
 	struct netfront_info *np = dev_get_drvdata(&dev->dev);
 	struct net_device *netdev = np->netdev;
+
+	np->otherend_id = np->xbdev->otherend_id;
 
 	dev_dbg(&dev->dev, "%s\n", xenbus_strstate(backend_state));
 
