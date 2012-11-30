@@ -145,9 +145,10 @@ struct netfront_info {
 #define RX_DFL_MIN_TARGET 64
 #define RX_MAX_TARGET min_t(int, NET_RX_RING_SIZE, 256)
 
-
-	struct sk_buff *rx_skbs[NET_RX_RING_SIZE];
-	grant_ref_t grant_rx_ref[NET_RX_RING_SIZE];
+	struct rx_slot {
+		struct sk_buff *skb;
+		grant_ref_t gref;
+	} rx_slots[NET_RX_RING_SIZE];
 };
 
 struct netfront_rx_info {
@@ -194,8 +195,8 @@ static struct sk_buff *xennet_get_rx_skb(struct netfront_info *np,
 					 RING_IDX ri)
 {
 	int i = xennet_rxidx(ri);
-	struct sk_buff *skb = np->rx_skbs[i];
-	np->rx_skbs[i] = NULL;
+	struct sk_buff *skb = np->rx_slots[i].skb;
+	np->rx_slots[i].skb = NULL;
 	return skb;
 }
 
@@ -203,8 +204,8 @@ static grant_ref_t xennet_get_rx_ref(struct netfront_info *np,
 					    RING_IDX ri)
 {
 	int i = xennet_rxidx(ri);
-	grant_ref_t ref = np->grant_rx_ref[i];
-	np->grant_rx_ref[i] = GRANT_INVALID_REF;
+	grant_ref_t ref = np->rx_slots[i].gref;
+	np->rx_slots[i].gref = GRANT_INVALID_REF;
 	return ref;
 }
 
@@ -317,12 +318,12 @@ no_skb:
 
 		id = xennet_rxidx(req_prod + i);
 
-		BUG_ON(np->rx_skbs[id]);
-		np->rx_skbs[id] = skb;
+		BUG_ON(np->rx_slots[id].skb);
+		np->rx_slots[id].skb = skb;
 
 		ref = gnttab_claim_grant_reference(&np->gref_rx_head);
 		BUG_ON((signed short)ref < 0);
-		np->grant_rx_ref[id] = ref;
+		np->rx_slots[id].gref = ref;
 
 		pfn = page_to_pfn(skb_frag_page(&skb_shinfo(skb)->frags[0]));
 		vaddr = page_address(skb_frag_page(&skb_shinfo(skb)->frags[0]));
@@ -613,9 +614,9 @@ static void xennet_move_rx_slot(struct netfront_info *np, struct sk_buff *skb,
 {
 	int new = xennet_rxidx(np->rx.req_prod_pvt);
 
-	BUG_ON(np->rx_skbs[new]);
-	np->rx_skbs[new] = skb;
-	np->grant_rx_ref[new] = ref;
+	BUG_ON(np->rx_slots[new].skb);
+	np->rx_slots[new].skb = skb;
+	np->rx_slots[new].gref = ref;
 	RING_GET_REQUEST(&np->rx, np->rx.req_prod_pvt)->id = new;
 	RING_GET_REQUEST(&np->rx, np->rx.req_prod_pvt)->gref = ref;
 	np->rx.req_prod_pvt++;
@@ -1230,8 +1231,8 @@ static struct net_device * __devinit xennet_create_dev(struct xenbus_device *dev
 
 	/* Clear out rx_skbs */
 	for (i = 0; i < NET_RX_RING_SIZE; i++) {
-		np->rx_skbs[i] = NULL;
-		np->grant_rx_ref[i] = GRANT_INVALID_REF;
+		np->rx_slots[i].skb = NULL;
+		np->rx_slots[i].gref = GRANT_INVALID_REF;
 	}
 
 	/* A grant for every tx ring slot */
@@ -1582,11 +1583,11 @@ static int xennet_connect(struct net_device *dev)
 	for (requeue_idx = 0, i = 0; i < NET_RX_RING_SIZE; i++) {
 		skb_frag_t *frag;
 		const struct page *page;
-		if (!np->rx_skbs[i])
+		if (!np->rx_slots[i].skb)
 			continue;
 
-		skb = np->rx_skbs[requeue_idx] = xennet_get_rx_skb(np, i);
-		ref = np->grant_rx_ref[requeue_idx] = xennet_get_rx_ref(np, i);
+		skb = np->rx_slots[requeue_idx].skb = xennet_get_rx_skb(np, i);
+		ref = np->rx_slots[requeue_idx].gref = xennet_get_rx_ref(np, i);
 		req = RING_GET_REQUEST(&np->rx, requeue_idx);
 
 		frag = &skb_shinfo(skb)->frags[0];
