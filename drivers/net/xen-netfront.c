@@ -79,17 +79,49 @@ struct netfront_stats {
 };
 
 struct netfront_info {
-	struct list_head list;
-	struct net_device *netdev;
+	/* XXX the hotpath needs to access xbdev->otherend_id, and
+	   only that field.  Might be worth caching it here. */
 
-	struct napi_struct napi;
-
-	unsigned int evtchn;
-	struct xenbus_device *xbdev;
-
+	/* Stuff accessed by TX, in the order it gets accessed, in the
+	   vague hope that that'll make the cache less thrashed.  */
+	struct netfront_stats __percpu *stats;
 	spinlock_t   tx_lock;
+	/* Two bytes padding here */
+	unsigned tx_skb_freelist;
 	struct xen_netif_tx_front_ring tx;
+	grant_ref_t gref_tx_head;
+	/* Four bytes padding here */
+	struct xenbus_device *xbdev;
+	struct net_device *netdev;
+	/* This is offset 64 bytes, which is usually a single cache line */
+
+	/* Now do the same for the receive side.  Receive also needs
+	   to pull in quite a lot of the TX cache line, but there's
+	   nothing we can really do about that. */
+	/* This is quite a bit bigger than a cache line (it's nearer
+	   three), but there's not much we can do about that,
+	   either. */
+	struct napi_struct napi;
+	spinlock_t rx_lock;
+	/* Two bytes padding here */
+	grant_ref_t gref_rx_head;
+	struct xen_netif_rx_front_ring rx;
+	unsigned long rx_gso_checksum_fixup;
+	unsigned rx_min_target;
+	unsigned rx_target;
+	unsigned rx_max_target;
+	/* Four bytes pad here */
+	struct sk_buff_head rx_batch;
+
+	struct timer_list rx_refill_timer;
+
+	/* Various bits of metadata which are only used for setup and
+	 * teardown. */
+	unsigned int evtchn;
 	int tx_ring_ref;
+	int rx_ring_ref;
+
+	/* Large structures go after here. */
 
 	/*
 	 * {tx,rx}_skbs store outstanding skbuffs. Free tx_skb entries
@@ -104,31 +136,16 @@ struct netfront_info {
 		struct sk_buff *skb;
 		unsigned long link;
 	} tx_skbs[NET_TX_RING_SIZE];
-	grant_ref_t gref_tx_head;
 	grant_ref_t grant_tx_ref[NET_TX_RING_SIZE];
-	unsigned tx_skb_freelist;
-
-	spinlock_t   rx_lock ____cacheline_aligned_in_smp;
-	struct xen_netif_rx_front_ring rx;
-	int rx_ring_ref;
 
 	/* Receive-ring batched refills. */
 #define RX_MIN_TARGET 8
 #define RX_DFL_MIN_TARGET 64
 #define RX_MAX_TARGET min_t(int, NET_RX_RING_SIZE, 256)
-	unsigned rx_min_target, rx_max_target, rx_target;
-	struct sk_buff_head rx_batch;
 
-	struct timer_list rx_refill_timer;
 
 	struct sk_buff *rx_skbs[NET_RX_RING_SIZE];
-	grant_ref_t gref_rx_head;
 	grant_ref_t grant_rx_ref[NET_RX_RING_SIZE];
-
-	/* Statistics */
-	struct netfront_stats __percpu *stats;
-
-	unsigned long rx_gso_checksum_fixup;
 };
 
 struct netfront_rx_info {
