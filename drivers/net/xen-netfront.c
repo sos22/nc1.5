@@ -81,6 +81,26 @@ struct netfront_stats {
 	struct u64_stats_sync	syncp;
 };
 
+/*
+ * {tx,rx}_skbs store outstanding skbuffs. Free tx_skb entries are
+ * linked from tx_skb_freelist through skb_entry.link.
+ *
+ * NB. Freelist index entries are always going to be less than
+ * PAGE_OFFSET, whereas pointers to skbs will always be equal or
+ * greater than PAGE_OFFSET: we use this property to distinguish them.
+ */
+struct tx_slot {
+	union {
+		struct sk_buff *skb;
+		unsigned long link;
+	};
+	grant_ref_t gref;
+};
+struct rx_slot {
+	struct sk_buff *skb;
+	grant_ref_t gref;
+};
+
 struct netfront_info {
 	/* Stuff accessed by TX, in the order it gets accessed, in the
 	   vague hope that that'll make the cache less thrashed.  */
@@ -92,6 +112,7 @@ struct netfront_info {
 	grant_ref_t gref_tx_head;
 	/* Four bytes padding here */
 	struct net_device *netdev;
+	struct tx_slot *tx_slots;
 
 	/* Now do the same for the receive side.  Receive also needs
 	   to pull in quite a lot of the TX cache line, but there's
@@ -110,6 +131,7 @@ struct netfront_info {
 	unsigned rx_max_target;
 	/* Four bytes pad here */
 	struct sk_buff_head rx_batch;
+	struct rx_slot *rx_slots;
 
 	struct timer_list rx_refill_timer;
 
@@ -119,29 +141,6 @@ struct netfront_info {
 	unsigned int evtchn;
 	int tx_ring_ref;
 	int rx_ring_ref;
-
-	/* Large structures go after here. */
-
-	/*
-	 * {tx,rx}_skbs store outstanding skbuffs. Free tx_skb entries
-	 * are linked from tx_skb_freelist through skb_entry.link.
-	 *
-	 *  NB. Freelist index entries are always going to be less than
-	 *  PAGE_OFFSET, whereas pointers to skbs will always be equal or
-	 *  greater than PAGE_OFFSET: we use this property to distinguish
-	 *  them.
-	 */
-	struct tx_slot {
-		union {
-			struct sk_buff *skb;
-			unsigned long link;
-		};
-		grant_ref_t gref;
-	} tx_slots[NET_TX_RING_SIZE];
-	struct rx_slot {
-		struct sk_buff *skb;
-		grant_ref_t gref;
-	} rx_slots[NET_RX_RING_SIZE];
 };
 
 struct netfront_rx_info {
@@ -1094,12 +1093,14 @@ static void xennet_release_tx_bufs(struct netfront_info *np)
 		add_id_to_freelist(&np->tx_skb_freelist, np->tx_slots, i);
 		dev_kfree_skb_irq(skb);
 	}
+	kfree(np->tx_slots);
 }
 
 static void xennet_uninit(struct net_device *dev)
 {
 	struct netfront_info *np = netdev_priv(dev);
 	xennet_release_tx_bufs(np);
+	kfree(np->rx_slots);
 	gnttab_free_grant_references(np->gref_tx_head);
 	gnttab_free_grant_references(np->gref_rx_head);
 }
@@ -1187,17 +1188,23 @@ static const struct net_device_ops xennet_netdev_ops = {
 
 static struct net_device * __devinit xennet_create_dev(struct xenbus_device *dev)
 {
-	int i, err;
+	int i;
 	struct net_device *netdev;
 	struct netfront_info *np;
+	struct tx_slot *tx_slots;
+	struct rx_slot *rx_slots;
 
+	tx_slots = kzalloc(sizeof(struct tx_slot) * NET_TX_RING_SIZE, GFP_KERNEL);
+	rx_slots = kzalloc(sizeof(struct rx_slot) * NET_RX_RING_SIZE, GFP_KERNEL);
 	netdev = alloc_etherdev(sizeof(struct netfront_info));
-	if (!netdev)
-		return ERR_PTR(-ENOMEM);
+	if (!tx_slots || !rx_slots || !netdev)
+		goto exit;
 
 	np                   = netdev_priv(netdev);
 	np->xbdev            = dev;
 	np->otherend_id      = dev->otherend_id;
+	np->tx_slots = tx_slots;
+	np->rx_slots = rx_slots;
 
 	spin_lock_init(&np->tx_lock);
 	spin_lock_init(&np->rx_lock);
@@ -1211,7 +1218,6 @@ static struct net_device * __devinit xennet_create_dev(struct xenbus_device *dev
 	np->rx_refill_timer.data = (unsigned long)netdev;
 	np->rx_refill_timer.function = rx_refill_timeout;
 
-	err = -ENOMEM;
 	np->stats = alloc_percpu(struct netfront_stats);
 	if (np->stats == NULL)
 		goto exit;
@@ -1233,14 +1239,12 @@ static struct net_device * __devinit xennet_create_dev(struct xenbus_device *dev
 	if (gnttab_alloc_grant_references(TX_MAX_TARGET,
 					  &np->gref_tx_head) < 0) {
 		printk(KERN_ALERT "#### netfront can't alloc tx grant refs\n");
-		err = -ENOMEM;
 		goto exit_free_stats;
 	}
 	/* A grant for every rx ring slot */
 	if (gnttab_alloc_grant_references(RX_MAX_TARGET,
 					  &np->gref_rx_head) < 0) {
 		printk(KERN_ALERT "#### netfront can't alloc rx grant refs\n");
-		err = -ENOMEM;
 		goto exit_free_tx;
 	}
 
@@ -1273,8 +1277,11 @@ static struct net_device * __devinit xennet_create_dev(struct xenbus_device *dev
  exit_free_stats:
 	free_percpu(np->stats);
  exit:
-	free_netdev(netdev);
-	return ERR_PTR(err);
+	kfree(tx_slots);
+	kfree(rx_slots);
+	if (netdev)
+		free_netdev(netdev);
+	return ERR_PTR(-ENOMEM);
 }
 
 /**
