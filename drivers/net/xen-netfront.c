@@ -139,8 +139,8 @@ struct netfront_info {
 	 * teardown. */
 	struct xenbus_device *xbdev;
 	unsigned int evtchn;
-	int tx_ring_ref;
-	int rx_ring_ref;
+	grant_ref_t tx_ring_ref;
+	grant_ref_t rx_ring_ref;
 };
 
 struct netfront_rx_info {
@@ -918,6 +918,11 @@ static int xennet_poll(struct napi_struct *napi, int budget)
 
 	spin_lock(&np->rx_lock);
 
+	if (unlikely(!netif_carrier_ok(dev))) {
+		spin_unlock(&np->rx_lock);
+		return 0;
+	}
+
 	skb_queue_head_init(&rxq);
 	skb_queue_head_init(&errq);
 	skb_queue_head_init(&tmpq);
@@ -1074,35 +1079,94 @@ static struct rtnl_link_stats64 *xennet_get_stats64(struct net_device *dev,
 	return tot;
 }
 
-static void xennet_release_tx_bufs(struct netfront_info *np)
+static void xennet_end_access(int ref, void *page)
 {
-	struct sk_buff *skb;
-	int i;
-
-	for (i = 0; i < NET_TX_RING_SIZE; i++) {
-		/* Skip over entries which are actually freelist references */
-		if (skb_entry_is_link(&np->tx_slots[i]))
-			continue;
-
-		skb = np->tx_slots[i].skb;
-		gnttab_end_foreign_access_ref(np->tx_slots[i].gref,
-					      GNTMAP_readonly);
-		gnttab_release_grant_reference(&np->gref_tx_head,
-					       np->tx_slots[i].gref);
-		np->tx_slots[i].gref = GRANT_INVALID_REF;
-		add_id_to_freelist(&np->tx_skb_freelist, np->tx_slots, i);
-		dev_kfree_skb_irq(skb);
-	}
-	kfree(np->tx_slots);
+	/* This frees the page as a side-effect */
+	if (ref != GRANT_INVALID_REF)
+		gnttab_end_foreign_access(ref, 0, (unsigned long)page);
 }
 
+/* Called from the xenbus probe thread. */
+static void xennet_disconnect_backend(struct netfront_info *info)
+{
+	int i;
+
+	/* Stop old i/f to prevent errors whilst we rebuild the state. */
+	spin_lock_bh(&info->rx_lock);
+	spin_lock_irq(&info->tx_lock);
+	netif_carrier_off(info->netdev);
+	spin_unlock_irq(&info->tx_lock);
+	spin_unlock_bh(&info->rx_lock);
+
+	if (info->netdev->irq)
+		unbind_from_irqhandler(info->netdev->irq, info->netdev);
+	info->evtchn = info->netdev->irq = 0;
+
+	/* End access and free the pages */
+	xennet_end_access(info->tx_ring_ref, info->tx.sring);
+	xennet_end_access(info->rx_ring_ref, info->rx.sring);
+
+	info->tx_ring_ref = GRANT_INVALID_REF;
+	info->rx_ring_ref = GRANT_INVALID_REF;
+	info->tx.sring = NULL;
+	info->rx.sring = NULL;
+
+	if (info->tx_slots) {
+		for (i = 0; i < NET_TX_RING_SIZE; i++) {
+			/* Skip over entries which are actually freelist references */
+			if (skb_entry_is_link(&info->tx_slots[i]))
+				continue;
+
+			if (info->tx_slots[i].gref != GRANT_INVALID_REF) {
+				if (gnttab_end_foreign_access_ref(info->tx_slots[i].gref,
+								  GNTMAP_readonly))
+					gnttab_release_grant_reference(&info->gref_tx_head,
+								       info->tx_slots[i].gref);
+				else
+					printk(KERN_WARNING "Leaking grant reference %d; still in use at backend\n",
+					       info->tx_slots[i].gref);
+			}
+			if (info->tx_slots[i].skb)
+				dev_kfree_skb_irq(info->tx_slots[i].skb);
+		}
+		kfree(info->tx_slots);
+		info->tx_slots = NULL;
+		info->tx_skb_freelist = 0;
+	} else {
+		BUG_ON(info->tx_skb_freelist);
+	}
+
+	if (info->rx_slots) {
+		for (i = 0; i < NET_RX_RING_SIZE; i++) {
+			if (info->rx_slots[i].gref != GRANT_INVALID_REF) {
+				if (gnttab_end_foreign_access_ref(info->rx_slots[i].gref, 0))
+					gnttab_release_grant_reference(&info->gref_tx_head,
+								       info->rx_slots[i].gref);
+				else
+					printk(KERN_WARNING "Leaking grant RX reference %d; still in use at backend\n",
+					       info->rx_slots[i].gref);
+			}
+			if (info->rx_slots[i].skb)
+				kfree_skb(info->rx_slots[i].skb);
+		}
+		kfree(info->rx_slots);
+		info->rx_slots = NULL;
+	}
+
+	if (info->gref_tx_head != GRANT_INVALID_REF)
+		gnttab_free_grant_references(info->gref_tx_head);
+	info->gref_tx_head = GRANT_INVALID_REF;
+	if (info->gref_rx_head != GRANT_INVALID_REF)
+		gnttab_free_grant_references(info->gref_rx_head);
+	info->gref_rx_head = GRANT_INVALID_REF;
+}
+
+/* Called by netdev core when we cann unregister_netdev i.e. from the
+ * xenbus probe thread. */
 static void xennet_uninit(struct net_device *dev)
 {
 	struct netfront_info *np = netdev_priv(dev);
-	xennet_release_tx_bufs(np);
-	kfree(np->rx_slots);
-	gnttab_free_grant_references(np->gref_tx_head);
-	gnttab_free_grant_references(np->gref_rx_head);
+	xennet_disconnect_backend(np);
 }
 
 static netdev_features_t xennet_fix_features(struct net_device *dev,
@@ -1188,69 +1252,50 @@ static const struct net_device_ops xennet_netdev_ops = {
 
 static struct net_device * __devinit xennet_create_dev(struct xenbus_device *dev)
 {
-	int i;
 	struct net_device *netdev;
 	struct netfront_info *np;
-	struct tx_slot *tx_slots;
-	struct rx_slot *rx_slots;
 
-	tx_slots = kzalloc(sizeof(struct tx_slot) * NET_TX_RING_SIZE, GFP_KERNEL);
-	rx_slots = kzalloc(sizeof(struct rx_slot) * NET_RX_RING_SIZE, GFP_KERNEL);
 	netdev = alloc_etherdev(sizeof(struct netfront_info));
-	if (!tx_slots || !rx_slots || !netdev)
-		goto exit;
+	if (!netdev)
+		return ERR_PTR(-ENOMEM);
 
-	np                   = netdev_priv(netdev);
-	np->xbdev            = dev;
-	np->otherend_id      = dev->otherend_id;
-	np->tx_slots = tx_slots;
-	np->rx_slots = rx_slots;
+	np = netdev_priv(netdev);
 
+	/* Initialise fields in structure order, to make it a bit
+	   clearer if we've forgotten something. */
+	np->stats                 = NULL;
 	spin_lock_init(&np->tx_lock);
+	np->otherend_id           = dev->otherend_id;
+	memset(&np->tx, 0, sizeof(np->tx));
+	np->gref_tx_head          = GRANT_INVALID_REF;
+	np->netdev                = netdev;
+	np->tx_slots              = NULL;
+	netif_napi_add(netdev, &np->napi, xennet_poll, 64);
 	spin_lock_init(&np->rx_lock);
-
+	np->gref_rx_head          = GRANT_INVALID_REF;
+	memset(&np->rx, 0, sizeof(np->rx));
+	np->rx_gso_checksum_fixup = 0;
+	np->rx_target             = RX_DFL_MIN_TARGET;
+	np->rx_min_target         = RX_DFL_MIN_TARGET;
+	np->rx_max_target         = RX_MAX_TARGET;
 	skb_queue_head_init(&np->rx_batch);
-	np->rx_target     = RX_DFL_MIN_TARGET;
-	np->rx_min_target = RX_DFL_MIN_TARGET;
-	np->rx_max_target = RX_MAX_TARGET;
-
+	np->rx_slots              = NULL;
 	init_timer(&np->rx_refill_timer);
-	np->rx_refill_timer.data = (unsigned long)netdev;
+	np->rx_refill_timer.data  = (unsigned long)netdev;
 	np->rx_refill_timer.function = rx_refill_timeout;
+	np->xbdev                 = dev;
+	np->evtchn                = 0;
+	np->tx_ring_ref           = GRANT_INVALID_REF;
+	np->rx_ring_ref           = GRANT_INVALID_REF;
 
 	np->stats = alloc_percpu(struct netfront_stats);
-	if (np->stats == NULL)
-		goto exit;
-
-	/* Initialise tx_skbs as a free chain containing every entry. */
-	np->tx_skb_freelist = 0;
-	for (i = 0; i < NET_TX_RING_SIZE; i++) {
-		skb_entry_set_link(&np->tx_slots[i], i+1);
-		np->tx_slots[i].gref = GRANT_INVALID_REF;
-	}
-
-	/* Clear out rx_skbs */
-	for (i = 0; i < NET_RX_RING_SIZE; i++) {
-		np->rx_slots[i].skb = NULL;
-		np->rx_slots[i].gref = GRANT_INVALID_REF;
-	}
-
-	/* A grant for every tx ring slot */
-	if (gnttab_alloc_grant_references(TX_MAX_TARGET,
-					  &np->gref_tx_head) < 0) {
-		printk(KERN_ALERT "#### netfront can't alloc tx grant refs\n");
-		goto exit_free_stats;
-	}
-	/* A grant for every rx ring slot */
-	if (gnttab_alloc_grant_references(RX_MAX_TARGET,
-					  &np->gref_rx_head) < 0) {
-		printk(KERN_ALERT "#### netfront can't alloc rx grant refs\n");
-		goto exit_free_tx;
+	if (np->stats == NULL) {
+		free_netdev(netdev);
+		return ERR_PTR(-ENOMEM);
 	}
 
 	netdev->netdev_ops	= &xennet_netdev_ops;
 
-	netif_napi_add(netdev, &np->napi, xennet_poll, 64);
 	netdev->features        = NETIF_F_IP_CSUM | NETIF_F_RXCSUM |
 				  NETIF_F_GSO_ROBUST;
 	netdev->hw_features	= NETIF_F_IP_CSUM | NETIF_F_SG | NETIF_F_TSO;
@@ -1266,22 +1311,9 @@ static struct net_device * __devinit xennet_create_dev(struct xenbus_device *dev
 	SET_ETHTOOL_OPS(netdev, &xennet_ethtool_ops);
 	SET_NETDEV_DEV(netdev, &dev->dev);
 
-	np->netdev = netdev;
-
 	netif_carrier_off(netdev);
 
 	return netdev;
-
- exit_free_tx:
-	gnttab_free_grant_references(np->gref_tx_head);
- exit_free_stats:
-	free_percpu(np->stats);
- exit:
-	kfree(tx_slots);
-	kfree(rx_slots);
-	if (netdev)
-		free_netdev(netdev);
-	return ERR_PTR(-ENOMEM);
 }
 
 /**
@@ -1329,36 +1361,6 @@ static int __devinit netfront_probe(struct xenbus_device *dev,
 	return err;
 }
 
-static void xennet_end_access(int ref, void *page)
-{
-	/* This frees the page as a side-effect */
-	if (ref != GRANT_INVALID_REF)
-		gnttab_end_foreign_access(ref, 0, (unsigned long)page);
-}
-
-static void xennet_disconnect_backend(struct netfront_info *info)
-{
-	/* Stop old i/f to prevent errors whilst we rebuild the state. */
-	spin_lock_bh(&info->rx_lock);
-	spin_lock_irq(&info->tx_lock);
-	netif_carrier_off(info->netdev);
-	spin_unlock_irq(&info->tx_lock);
-	spin_unlock_bh(&info->rx_lock);
-
-	if (info->netdev->irq)
-		unbind_from_irqhandler(info->netdev->irq, info->netdev);
-	info->evtchn = info->netdev->irq = 0;
-
-	/* End access and free the pages */
-	xennet_end_access(info->tx_ring_ref, info->tx.sring);
-	xennet_end_access(info->rx_ring_ref, info->rx.sring);
-
-	info->tx_ring_ref = GRANT_INVALID_REF;
-	info->rx_ring_ref = GRANT_INVALID_REF;
-	info->tx.sring = NULL;
-	info->rx.sring = NULL;
-}
-
 /**
  * We are reconnecting to the backend, due to a suspend/resume, or a backend
  * driver restart.  We tear down our netif structure and recreate it, but
@@ -1399,16 +1401,19 @@ static int xen_net_read_mac(struct xenbus_device *dev, u8 mac[])
 
 static int setup_netfront(struct xenbus_device *dev, struct netfront_info *info)
 {
-	struct xen_netif_tx_sring *txs;
-	struct xen_netif_rx_sring *rxs;
-	int err;
 	struct net_device *netdev = info->netdev;
-
-	info->tx_ring_ref = GRANT_INVALID_REF;
-	info->rx_ring_ref = GRANT_INVALID_REF;
-	info->rx.sring = NULL;
-	info->tx.sring = NULL;
-	netdev->irq = 0;
+	struct tx_slot *tx_slots = NULL;
+	struct rx_slot *rx_slots = NULL;
+	struct xen_netif_tx_sring *txs = NULL;
+	struct xen_netif_rx_sring *rxs = NULL;
+	grant_ref_t tx_ring_ref = GRANT_INVALID_REF;
+	grant_ref_t rx_ring_ref = GRANT_INVALID_REF;
+	grant_ref_t gref_tx_head = GRANT_INVALID_REF;
+	grant_ref_t gref_rx_head = GRANT_INVALID_REF;
+	int evtchn = -1;
+	int err;
+	int irq;
+	int i;
 
 	err = xen_net_read_mac(dev, netdev->dev_addr);
 	if (err) {
@@ -1416,50 +1421,101 @@ static int setup_netfront(struct xenbus_device *dev, struct netfront_info *info)
 		goto fail;
 	}
 
+	/* First allocate all of the resources we're going to need. */
+	err = -ENOMEM;
+	tx_slots = kzalloc(sizeof(tx_slots[0]) * NET_TX_RING_SIZE, GFP_KERNEL);
+	rx_slots = kzalloc(sizeof(rx_slots[0]) * NET_RX_RING_SIZE, GFP_KERNEL);
 	txs = (struct xen_netif_tx_sring *)get_zeroed_page(GFP_NOIO | __GFP_HIGH);
-	if (!txs) {
-		err = -ENOMEM;
-		xenbus_dev_fatal(dev, err, "allocating tx ring page");
+	rxs = (struct xen_netif_rx_sring *)get_zeroed_page(GFP_NOIO | __GFP_HIGH);
+	if (!tx_slots || !rx_slots || !txs || !rxs) {
+		xenbus_dev_fatal(dev, err, "allocating ring-related structures");
 		goto fail;
 	}
+
+	/* A grant for every tx ring slot */
+	err = gnttab_alloc_grant_references(TX_MAX_TARGET, &gref_tx_head);
+	if (err < 0) {
+		xenbus_dev_fatal(dev, err,
+				 "allocating %d tx grant refs",
+				 TX_MAX_TARGET);
+		goto fail;
+	}
+	/* A grant for every rx ring slot */
+	err = gnttab_alloc_grant_references(RX_MAX_TARGET, &gref_rx_head);
+	if (err < 0) {
+		xenbus_dev_fatal(dev, err,
+				 "allocating %d rx grant refs",
+				 RX_MAX_TARGET);
+		goto fail;
+	}
+
+	err = xenbus_grant_ring(dev, virt_to_mfn(txs));
+	if (err < 0)
+		goto fail;
+	tx_ring_ref = err;
+	err = xenbus_grant_ring(dev, virt_to_mfn(rxs));
+	if (err < 0)
+		goto fail;
+	rx_ring_ref = err;
+	err = xenbus_alloc_evtchn(dev, &evtchn);
+	if (err)
+		goto fail;
+	err = bind_evtchn_to_irqhandler(evtchn, xennet_interrupt,
+					0, netdev->name, netdev);
+	if (err < 0) {
+		xenbus_dev_fatal(dev, err,
+				 "binding IRQ to event channel");
+		goto fail;
+	}
+	irq = err;
+
+	/* Okay, that's all of the ways we can fail out of the way.
+	   Initialise everything and shove it in the info
+	   structure. */
+	for (i = 0; i < NET_TX_RING_SIZE; i++) {
+		skb_entry_set_link(&tx_slots[i], i+1);
+		tx_slots[i].gref = GRANT_INVALID_REF;
+	}
+	info->tx_slots = tx_slots;
+	info->tx_skb_freelist = 0;
+
+	for (i = 0; i < NET_RX_RING_SIZE; i++) {
+		rx_slots[i].skb = NULL;
+		rx_slots[i].gref = GRANT_INVALID_REF;
+	}
+	info->rx_slots = rx_slots;
+
 	SHARED_RING_INIT(txs);
 	FRONT_RING_INIT(&info->tx, txs, PAGE_SIZE);
 
-	err = xenbus_grant_ring(dev, virt_to_mfn(txs));
-	if (err < 0) {
-		free_page((unsigned long)txs);
-		goto fail;
-	}
-
-	info->tx_ring_ref = err;
-	rxs = (struct xen_netif_rx_sring *)get_zeroed_page(GFP_NOIO | __GFP_HIGH);
-	if (!rxs) {
-		err = -ENOMEM;
-		xenbus_dev_fatal(dev, err, "allocating rx ring page");
-		goto fail;
-	}
 	SHARED_RING_INIT(rxs);
 	FRONT_RING_INIT(&info->rx, rxs, PAGE_SIZE);
 
-	err = xenbus_grant_ring(dev, virt_to_mfn(rxs));
-	if (err < 0) {
-		free_page((unsigned long)rxs);
-		goto fail;
-	}
-	info->rx_ring_ref = err;
-
-	err = xenbus_alloc_evtchn(dev, &info->evtchn);
-	if (err)
-		goto fail;
-
-	err = bind_evtchn_to_irqhandler(info->evtchn, xennet_interrupt,
-					0, netdev->name, netdev);
-	if (err < 0)
-		goto fail;
-	netdev->irq = err;
+	info->gref_tx_head = gref_tx_head;
+	info->gref_rx_head = gref_rx_head;
+	info->tx_ring_ref = tx_ring_ref;
+	info->rx_ring_ref = rx_ring_ref;
+	info->evtchn = evtchn;
+	netdev->irq = irq;
 	return 0;
 
  fail:
+	kfree(tx_slots);
+	kfree(rx_slots);
+	if (tx_ring_ref != GRANT_INVALID_REF)
+		gnttab_end_foreign_access(tx_ring_ref, 0, (unsigned long)txs);
+	else if (txs)
+		free_page((unsigned long)txs);
+	if (rx_ring_ref != GRANT_INVALID_REF)
+		gnttab_end_foreign_access(rx_ring_ref, 0, (unsigned long)rxs);
+	else if (rxs)
+		free_page((unsigned long)rxs);
+	if (gref_tx_head != GRANT_INVALID_REF)
+		gnttab_free_grant_references(gref_tx_head);
+	if (gref_rx_head != GRANT_INVALID_REF)
+		gnttab_free_grant_references(gref_rx_head);
+	if (evtchn != -1)
+		xenbus_free_evtchn(dev, evtchn);
 	return err;
 }
 
@@ -1470,6 +1526,10 @@ static int talk_to_netback(struct xenbus_device *dev,
 	const char *message;
 	struct xenbus_transaction xbt;
 	int err;
+
+	/* Get everything into a sane state, clearing out any old ring
+	 * state which might be lying around */
+	xennet_disconnect_backend(info);
 
 	/* Create shared ring, alloc event channel. */
 	err = setup_netfront(dev, info);
@@ -1549,10 +1609,7 @@ again:
 static int xennet_connect(struct net_device *dev)
 {
 	struct netfront_info *np = netdev_priv(dev);
-	int i, requeue_idx, err;
-	struct sk_buff *skb;
-	grant_ref_t ref;
-	struct xen_netif_rx_request *req;
+	int err;
 	unsigned int feature_rx_copy;
 
 	err = xenbus_scanf(XBT_NIL, np->xbdev->otherend,
@@ -1577,50 +1634,26 @@ static int xennet_connect(struct net_device *dev)
 	spin_lock_bh(&np->rx_lock);
 	spin_lock_irq(&np->tx_lock);
 
-	/* Step 1: Discard all pending TX packet fragments. */
-	xennet_release_tx_bufs(np);
-
-	/* Step 2: Rebuild the RX buffer freelist and the RX ring itself. */
-	for (requeue_idx = 0, i = 0; i < NET_RX_RING_SIZE; i++) {
-		skb_frag_t *frag;
-		const struct page *page;
-		if (!np->rx_slots[i].skb)
-			continue;
-
-		skb = np->rx_slots[requeue_idx].skb = xennet_get_rx_skb(np, i);
-		ref = np->rx_slots[requeue_idx].gref = xennet_get_rx_ref(np, i);
-		req = RING_GET_REQUEST(&np->rx, requeue_idx);
-
-		frag = &skb_shinfo(skb)->frags[0];
-		page = skb_frag_page(frag);
-		gnttab_grant_foreign_access_ref(
-			ref, np->otherend_id,
-			pfn_to_mfn(page_to_pfn(page)),
-			0);
-		req->gref = ref;
-		req->id   = requeue_idx;
-
-		requeue_idx++;
-	}
-
-	np->rx.req_prod_pvt = requeue_idx;
-
 	/*
-	 * Step 3: All public and private state should now be sane.  Get
-	 * ready to start sending and receiving packets and give the driver
-	 * domain a kick because we've probably just requeued some
-	 * packets.
+	 * All public and private state should now be sane.  Get ready
+	 * to start sending and receiving packets.  We kick both the
+	 * remote domain and the local NAPI just so as we can be
+	 * certain we don't have any lost wakeups if something
+	 * interesting happens while we're setting up.
 	 */
 	netif_carrier_on(np->netdev);
 	notify_remote_via_irq(np->netdev->irq);
 	xennet_tx_buf_gc(dev);
 	xennet_alloc_rx_buffers(dev);
+	napi_schedule(&np->napi);
 
 	spin_unlock_irq(&np->tx_lock);
 	spin_unlock_bh(&np->rx_lock);
 
 	return 0;
 }
+
+
 
 /**
  * Callback received when the backend's state changes.
