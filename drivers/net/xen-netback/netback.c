@@ -152,12 +152,12 @@ static void xen_netbk_idx_release(struct xen_netbk *netbk, u16 pending_idx);
 static void make_tx_response(struct xenvif *vif,
 			     struct xen_netif_tx_request *txp,
 			     s8       st);
-static struct xen_netif_rx_response *make_rx_response(struct xenvif *vif,
-					     u16      id,
-					     s8       st,
-					     u16      offset,
-					     u16      size,
-					     u16      flags);
+static void make_rx_response(struct xenvif *vif,
+			     u16      id,
+			     s8       st,
+			     u16      offset,
+			     u16      size,
+			     u16      flags);
 
 static inline unsigned long idx_to_pfn(struct xen_netbk *netbk,
 				       u16 idx)
@@ -606,14 +606,12 @@ static void xen_netbk_rx_action(struct xen_netbk *netbk)
 	struct xenvif *vif = NULL, *tmp;
 	s8 status;
 	u16 irq, flags;
-	struct xen_netif_rx_response *resp;
 	struct sk_buff_head rxq;
 	struct sk_buff *skb;
 	LIST_HEAD(notify);
 	int ret;
 	int nr_frags;
 	int count;
-	unsigned long offset;
 	struct skb_cb_overlay *sco;
 
 	struct netrx_pending_operations npo = {
@@ -657,15 +655,12 @@ static void xen_netbk_rx_action(struct xen_netbk *netbk)
 		vif = netdev_priv(skb->dev);
 
 		if (netbk->meta[npo.meta_cons].gso_size && vif->gso_prefix) {
-			resp = RING_GET_RESPONSE(&vif->rx,
-						vif->rx.rsp_prod_pvt++);
-
-			resp->flags = XEN_NETRXF_gso_prefix | XEN_NETRXF_more_data;
-
-			resp->offset = netbk->meta[npo.meta_cons].gso_size;
-			resp->id = netbk->meta[npo.meta_cons].id;
-			resp->status = sco->meta_slots_used;
-
+			make_rx_response(vif,
+					 netbk->meta[npo.meta_cons].id,
+					 0,
+					 netbk->meta[npo.meta_cons].gso_size,
+					 sco->meta_slots_used,
+					 XEN_NETRXF_gso_prefix | XEN_NETRXF_more_data);
 			npo.meta_cons++;
 			sco->meta_slots_used--;
 		}
@@ -687,19 +682,21 @@ static void xen_netbk_rx_action(struct xen_netbk *netbk)
 			/* remote but checksummed. */
 			flags |= XEN_NETRXF_data_validated;
 
-		offset = 0;
-		resp = make_rx_response(vif, netbk->meta[npo.meta_cons].id,
-					status, offset,
-					netbk->meta[npo.meta_cons].size,
-					flags);
+		if (netbk->meta[npo.meta_cons].gso_size && !vif->gso_prefix)
+			flags |= XEN_NETRXF_extra_info;
+
+		make_rx_response(vif,
+				 netbk->meta[npo.meta_cons].id,
+				 status,
+				 0,
+				 netbk->meta[npo.meta_cons].size,
+				 flags);
 
 		if (netbk->meta[npo.meta_cons].gso_size && !vif->gso_prefix) {
 			struct xen_netif_extra_info *gso =
 				(struct xen_netif_extra_info *)
 				RING_GET_RESPONSE(&vif->rx,
 						  vif->rx.rsp_prod_pvt++);
-
-			resp->flags |= XEN_NETRXF_extra_info;
 
 			gso->u.gso.size = netbk->meta[npo.meta_cons].gso_size;
 			gso->u.gso.type = XEN_NETIF_GSO_TYPE_TCPV4;
@@ -1533,12 +1530,12 @@ static void make_tx_response(struct xenvif *vif,
 		notify_remote_via_irq(vif->irq);
 }
 
-static struct xen_netif_rx_response *make_rx_response(struct xenvif *vif,
-					     u16      id,
-					     s8       st,
-					     u16      offset,
-					     u16      size,
-					     u16      flags)
+static void make_rx_response(struct xenvif *vif,
+			     u16      id,
+			     s8       st,
+			     u16      offset,
+			     u16      size,
+			     u16      flags)
 {
 	RING_IDX i = vif->rx.rsp_prod_pvt;
 	struct xen_netif_rx_response *resp;
@@ -1552,8 +1549,6 @@ static struct xen_netif_rx_response *make_rx_response(struct xenvif *vif,
 		resp->status = (s16)st;
 
 	vif->rx.rsp_prod_pvt = ++i;
-
-	return resp;
 }
 
 static inline int rx_work_todo(struct xen_netbk *netbk)
