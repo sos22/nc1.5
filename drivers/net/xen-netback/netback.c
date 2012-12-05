@@ -59,6 +59,8 @@ struct netbk_rx_meta {
 };
 
 #define MAX_PENDING_REQS 256
+#define XEN_NETIF_RX_RING_SIZE __CONST_RING_SIZE(xen_netif_rx, PAGE_SIZE)
+#define RX_MAX_REQS_PER_BATCH XEN_NETIF_RX_RING_SIZE
 
 /* Discriminate from any valid pending_idx value. */
 #define INVALID_PENDING_IDX 0xFFFF
@@ -110,8 +112,8 @@ struct xen_netbk {
 	 * head/fragment page uses 2 copy operations because it
 	 * straddles two buffers in the frontend.
 	 */
-	struct gnttab_copy grant_copy_op[2*XEN_NETIF_RX_RING_SIZE];
-	struct netbk_rx_meta meta[2*XEN_NETIF_RX_RING_SIZE];
+	struct gnttab_copy grant_copy_op[2 * RX_MAX_REQS_PER_BATCH];
+	struct netbk_rx_meta meta[2 * RX_MAX_REQS_PER_BATCH];
 };
 
 static struct xen_netbk *xen_netbk;
@@ -256,11 +258,21 @@ static int max_required_rx_slots(struct xenvif *vif)
 
 int xen_netbk_rx_ring_full(struct xenvif *vif)
 {
+	/* peek tells us what rx_req_cons will be when all
+	   currently-accepted packets are pushed to the ring. */
 	RING_IDX peek   = vif->rx_req_cons_peek;
 	RING_IDX needed = max_required_rx_slots(vif);
-
-	return ((vif->rx.sring->req_prod - peek) < needed) ||
-	       ((vif->rx.rsp_prod_pvt + XEN_NETIF_RX_RING_SIZE - peek) < needed);
+	/* There are two ways for the RX ring to be full.  It might be
+	 * that we don't have enough pending buffers: */
+	if (vif->rx.sring->req_prod - peek < needed)
+		return 1;
+	/* Or it might be that we've hit the limit on the number of
+	   requests we can handle per batch before we overflow the
+	   hypercall batchers in the xen_netbk structure: */
+	if (vif->rx.rsp_prod_pvt + RX_MAX_REQS_PER_BATCH - peek < needed)
+		return 1;
+	/* Otherwise, we're fine. */
+	return 0;
 }
 
 int xen_netbk_must_stop_queue(struct xenvif *vif)
@@ -625,7 +637,7 @@ static void xen_netbk_rx_action(struct xen_netbk *netbk)
 		__skb_queue_tail(&rxq, skb);
 
 		/* Filled the batch queue? */
-		if (count + MAX_SKB_FRAGS >= XEN_NETIF_RX_RING_SIZE)
+		if (count + MAX_SKB_FRAGS >= RX_MAX_REQS_PER_BATCH)
 			break;
 	}
 
