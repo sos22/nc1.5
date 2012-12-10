@@ -63,13 +63,22 @@ struct xenvif {
 	unsigned int     irq;
 
 	unsigned nr_ring_pages;
+	int large_rings;
 
 	/* List of frontends to notify after a batch of frames sent. */
 	struct list_head notify_list;
 
 	/* The shared rings and indexes. */
-	struct xen_netif_tx_back_ring tx;
-	struct xen_netif_rx_back_ring rx;
+	union {
+		struct {
+			struct xen_netif_tx_small_back_ring tx;
+			struct xen_netif_rx_small_back_ring rx;
+		} small;
+		struct {
+			struct xen_netif_tx_large_back_ring tx;
+			struct xen_netif_rx_large_back_ring rx;
+		} large;
+	} rings;
 
 	/* Frontend feature information. */
 	u8 can_sg:1;

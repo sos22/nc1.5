@@ -47,13 +47,47 @@
 #define _XEN_NETTXF_extra_info		(3)
 #define  XEN_NETTXF_extra_info		(1U<<_XEN_NETTXF_extra_info)
 
-struct xen_netif_tx_request {
+#define XEN_NETIF_LARGE_REQUEST_SIZE 128
+
+struct xen_netif_tx_request_small {
     grant_ref_t gref;      /* Reference to buffer page */
     uint16_t offset;       /* Offset within buffer page */
     uint16_t flags;        /* XEN_NETTXF_* */
     uint16_t id;           /* Echoed in response message. */
     uint16_t size;         /* Packet size in bytes.       */
 };
+
+struct netif_gso {
+	/*
+	 * Maximum payload size of each segment. For
+	 * example, for TCP this is just the path MSS.
+	 */
+	uint16_t size;
+
+	/*
+	 * GSO type. This determines the protocol of
+	 * the packet and any extra features required
+	 * to segment the packet properly.
+	 */
+	uint8_t type; /* XEN_NETIF_GSO_TYPE_* */
+
+	/* Future expansion. */
+	uint8_t pad;
+
+	/*
+	 * GSO features. This specifies any extra GSO
+	 * features required to process this packet,
+	 * such as ECN support for TCPv4.
+	 */
+	uint16_t features; /* XEN_NETIF_GSO_FEAT_* */
+};
+
+struct xen_netif_tx_request_large {
+    struct xen_netif_tx_request_small hdr;
+    uint16_t nr_inline_bytes;
+    struct netif_gso gso;
+    unsigned char inline_bytes[0];
+} __attribute__((__aligned__(XEN_NETIF_LARGE_REQUEST_SIZE)));
 
 /* Types of xen_netif_extra_info descriptors. */
 #define XEN_NETIF_EXTRA_TYPE_NONE	(0)  /* Never used - invalid */
@@ -76,31 +110,7 @@ struct xen_netif_extra_info {
 	uint8_t flags; /* XEN_NETIF_EXTRA_FLAG_* */
 
 	union {
-		struct {
-			/*
-			 * Maximum payload size of each segment. For
-			 * example, for TCP this is just the path MSS.
-			 */
-			uint16_t size;
-
-			/*
-			 * GSO type. This determines the protocol of
-			 * the packet and any extra features required
-			 * to segment the packet properly.
-			 */
-			uint8_t type; /* XEN_NETIF_GSO_TYPE_* */
-
-			/* Future expansion. */
-			uint8_t pad;
-
-			/*
-			 * GSO features. This specifies any extra GSO
-			 * features required to process this packet,
-			 * such as ECN support for TCPv4.
-			 */
-			uint16_t features; /* XEN_NETIF_GSO_FEAT_* */
-		} gso;
-
+		struct netif_gso gso;
 		uint16_t pad[3];
 	} u;
 };
@@ -135,23 +145,35 @@ struct xen_netif_rx_request {
 #define _XEN_NETRXF_gso_prefix		(4)
 #define  XEN_NETRXF_gso_prefix		(1U<<_XEN_NETRXF_gso_prefix)
 
-struct xen_netif_rx_response {
+struct xen_netif_rx_response_small {
     uint16_t id;
     uint16_t offset;       /* Offset in page of start of received packet  */
     uint16_t flags;        /* XEN_NETRXF_* */
     int16_t  status;       /* -ve: BLKIF_RSP_* ; +ve: Rx'ed pkt size. */
 };
+struct xen_netif_rx_response_large {
+    struct xen_netif_rx_response_small hdr;
+    uint16_t nr_inline_bytes;
+    struct netif_gso gso;
+    unsigned char inline_bytes[0];
+} __attribute__((__aligned__(XEN_NETIF_LARGE_REQUEST_SIZE)));
 
 /*
  * Generate netif ring structures and types.
  */
 
-DEFINE_RING_TYPES(xen_netif_tx,
-		  struct xen_netif_tx_request,
+DEFINE_RING_TYPES(xen_netif_tx_small,
+		  struct xen_netif_tx_request_small,
 		  struct xen_netif_tx_response);
-DEFINE_RING_TYPES(xen_netif_rx,
+DEFINE_RING_TYPES(xen_netif_rx_small,
 		  struct xen_netif_rx_request,
-		  struct xen_netif_rx_response);
+		  struct xen_netif_rx_response_small);
+DEFINE_RING_TYPES(xen_netif_tx_large,
+		  struct xen_netif_tx_request_large,
+		  struct xen_netif_tx_response);
+DEFINE_RING_TYPES(xen_netif_rx_large,
+		  struct xen_netif_rx_request,
+		  struct xen_netif_rx_response_large);
 
 #define XEN_NETIF_RSP_DROPPED	-2
 #define XEN_NETIF_RSP_ERROR	-1

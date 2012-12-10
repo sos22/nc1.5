@@ -68,12 +68,14 @@ struct netfront_cb {
 
 #define GRANT_INVALID_REF	0
 
-#define NET_TX_RING_SIZE(nr_pages) __CONST_RING_SIZE(xen_netif_tx, PAGE_SIZE * nr_pages)
-#define NET_RX_RING_SIZE(nr_pages) __CONST_RING_SIZE(xen_netif_rx, PAGE_SIZE * nr_pages)
-#define TX_MAX_TARGET(nr_pages) min_t(int, NET_TX_RING_SIZE(nr_pages), 256)
+#define NET_TX_RING_SIZE_LARGE(nr_pages) __CONST_RING_SIZE(xen_netif_tx_large, PAGE_SIZE * nr_pages)
+#define NET_RX_RING_SIZE_LARGE(nr_pages) __CONST_RING_SIZE(xen_netif_rx_large, PAGE_SIZE * nr_pages)
+#define NET_TX_RING_SIZE_SMALL(nr_pages) __CONST_RING_SIZE(xen_netif_tx_small, PAGE_SIZE * nr_pages)
+#define NET_RX_RING_SIZE_SMALL(nr_pages) __CONST_RING_SIZE(xen_netif_rx_small, PAGE_SIZE * nr_pages)
+#define TX_MAX_TARGET(nr_pages) min_t(int, NET_TX_RING_SIZE_SMALL(nr_pages), 256)
 #define RX_MIN_TARGET 8
 #define RX_DFL_MIN_TARGET 64
-#define RX_MAX_TARGET(nr_pages) min_t(int, NET_RX_RING_SIZE(nr_pages), 256)
+#define RX_MAX_TARGET(nr_pages) min_t(int, NET_RX_RING_SIZE_SMALL(nr_pages), 256)
 
 struct netfront_stats {
 	u64			rx_packets;
@@ -1441,6 +1443,12 @@ static int xen_net_read_mac(struct xenbus_device *dev, u8 mac[])
 
 static int setup_netfront(struct xenbus_device *dev, struct netfront_info *info)
 {
+<<<<<<< Updated upstream
+=======
+	void *txs;
+	void *rxs;
+	int err;
+>>>>>>> Stashed changes
 	struct net_device *netdev = info->netdev;
 	int max_pages;
 	int multipage;
@@ -1456,6 +1464,7 @@ static int setup_netfront(struct xenbus_device *dev, struct netfront_info *info)
 	int err;
 	int irq;
 	int i;
+	int large_requests;
 
 	/* Grab backend parameters */
 	err = xen_net_read_mac(dev, netdev->dev_addr);
@@ -1476,6 +1485,7 @@ static int setup_netfront(struct xenbus_device *dev, struct netfront_info *info)
 	     nr_ring_pages <<= 1)
 		;
 
+<<<<<<< Updated upstream
 	/* Allocate resources */
 	err = -ENOMEM;
 #warning tx_slots and rx_slots are quite big; should maybe be vmalloc()?
@@ -1492,6 +1502,41 @@ static int setup_netfront(struct xenbus_device *dev, struct netfront_info *info)
 	if (!ring_refs) {
 		xenbus_dev_fatal(dev, err,
 				 "allocating temporary memory for connection setup");
+=======
+	/* There's really no point at all in trying to use large
+	   requests with a single page ring.  Arbitrarily declare that
+	   we're only going to support large requests if we have at
+	   least four ring pages. */
+	if (nr_ring_pages >= 4) {
+		err = xenbus_scanf(XBT_NIL, dev->otherend, "feature-large-requests",
+				   "%d", &large_requests);
+		if (err == -ENOENT) {
+			large_requests = 0;
+		} else if (err < 0) {
+			xenbus_dev_fatal(dev, err, "reading %s/feature-large-requests", dev->otherend);
+			goto fail;
+		}
+	} else {
+		large_requests = 0;
+	}
+	info->large_requests = large_requests;
+
+	txs = __vmalloc(PAGE_SIZE * nr_ring_pages,
+			GFP_NOIO | __GFP_HIGH,
+			PAGE_KERNEL);
+	if (!txs) {
+		err = -ENOMEM;
+		xenbus_dev_fatal(dev, err, "allocating tx ring page");
+		goto fail;
+	}
+	if (
+	SHARED_RING_INIT(txs);
+	FRONT_RING_INIT(&info->tx, txs, PAGE_SIZE * nr_ring_pages);
+
+	err = xenbus_grant_ring_virt(dev, txs, nr_ring_pages, info->tx_ring_refs);
+	if (err < 0) {
+		free_page((unsigned long)txs);
+>>>>>>> Stashed changes
 		goto fail;
 	}
 	for (i = 0; i < nr_ring_pages * 2; i++)

@@ -95,6 +95,13 @@ static int netback_probe(struct xenbus_device *dev,
 			goto abort_transaction;
 		}
 
+		err = xenbus_printf(xbt, dev->nodename, "feature-large-requests",
+				    "%d", 1);
+		if (err) {
+			message = "writing feature-large-requests";
+			goto abort_transaction;
+		}
+
 		err = xenbus_printf(xbt, dev->nodename, "feature-gso-tcpv4",
 				    "%d", sg);
 		if (err) {

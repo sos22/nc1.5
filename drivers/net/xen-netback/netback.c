@@ -46,8 +46,12 @@
 #include <asm/xen/hypercall.h>
 #include <asm/xen/page.h>
 
+union xen_netif_rx_response {
+	struct xen_netif_rx_response_large large;
+	struct xen_netif_rx_response_small small;
+};
 struct pending_tx_info {
-	struct xen_netif_tx_request req;
+	struct xen_netif_tx_request_large req;
 	struct xenvif *vif;
 };
 typedef unsigned int pending_ring_idx_t;
@@ -59,8 +63,7 @@ struct netbk_rx_meta {
 };
 
 #define MAX_PENDING_REQS 256
-#define XEN_NETIF_RX_RING_SIZE __CONST_RING_SIZE(xen_netif_rx, PAGE_SIZE)
-#define RX_MAX_REQS_PER_BATCH XEN_NETIF_RX_RING_SIZE
+#define RX_MAX_REQS_PER_BATCH 256
 
 /* Discriminate from any valid pending_idx value. */
 #define INVALID_PENDING_IDX 0xFFFF
@@ -150,7 +153,7 @@ void xen_netbk_remove_xenvif(struct xenvif *vif)
 
 static void xen_netbk_idx_release(struct xen_netbk *netbk, u16 pending_idx);
 static void make_tx_response(struct xenvif *vif,
-			     struct xen_netif_tx_request *txp,
+			     struct xen_netif_tx_request_small *txp,
 			     s8       st);
 static void make_rx_response(struct xenvif *vif,
 			     u16      id,
@@ -262,14 +265,22 @@ int xen_netbk_rx_ring_full(struct xenvif *vif)
 	   currently-accepted packets are pushed to the ring. */
 	RING_IDX peek   = vif->rx_req_cons_peek;
 	RING_IDX needed = max_required_rx_slots(vif);
+	RING_IDX req_prod =
+		vif->large_rings ?
+		vif->rings.large.rx.sring->req_prod :
+		vif->rings.small.rx.sring->req_prod;
+	RING_IDX rsp_prod_pvt =
+		vif->large_rings ?
+		vif->rings.large.rx.rsp_prod_pvt :
+		vif->rings.small.rx.rsp_prod_pvt;
 	/* There are two ways for the RX ring to be full.  It might be
 	 * that we don't have enough pending buffers: */
-	if (vif->rx.sring->req_prod - peek < needed)
+	if (req_prod - peek < needed)
 		return 1;
 	/* Or it might be that we've hit the limit on the number of
 	   requests we can handle per batch before we overflow the
 	   hypercall batchers in the xen_netbk structure: */
-	if (vif->rx.rsp_prod_pvt + RX_MAX_REQS_PER_BATCH - peek < needed)
+	if (rsp_prod_pvt + RX_MAX_REQS_PER_BATCH - peek < needed)
 		return 1;
 	/* Otherwise, we're fine. */
 	return 0;
@@ -280,8 +291,12 @@ int xen_netbk_must_stop_queue(struct xenvif *vif)
 	if (!xen_netbk_rx_ring_full(vif))
 		return 0;
 
-	vif->rx.sring->req_event = vif->rx_req_cons_peek +
-		max_required_rx_slots(vif);
+	if (vif->large_rings)
+		vif->rings.large.rx.sring->req_event = vif->rx_req_cons_peek +
+			max_required_rx_slots(vif);
+	else
+		vif->rings.small.rx.sring->req_event = vif->rx_req_cons_peek +
+			max_required_rx_slots(vif);
 	mb(); /* request notification /then/ check the queue */
 
 	return xen_netbk_rx_ring_full(vif);
@@ -375,13 +390,21 @@ struct netrx_pending_operations {
 	grant_ref_t copy_gref;
 };
 
+static struct xen_netif_rx_request *get_next_rx_request(struct xenvif *vif)
+{
+	if (vif->large_rings)
+		return RING_GET_REQUEST(&vif->rings.large.rx, vif->rings.large.rx.req_cons++);
+	else
+		return RING_GET_REQUEST(&vif->rings.small.rx, vif->rings.small.rx.req_cons++);
+}
+
 static struct netbk_rx_meta *get_next_rx_buffer(struct xenvif *vif,
 						struct netrx_pending_operations *npo)
 {
 	struct netbk_rx_meta *meta;
 	struct xen_netif_rx_request *req;
 
-	req = RING_GET_REQUEST(&vif->rx, vif->rx.req_cons++);
+	req = get_next_rx_request(vif);
 
 	meta = npo->meta + npo->meta_prod++;
 	meta->gso_size = 0;
@@ -444,7 +467,7 @@ static void netbk_gop_frag_copy(struct xenvif *vif, struct sk_buff *skb,
 			src_pend = &netbk->pending_tx_info[idx];
 
 			copy_gop->source.domid = src_pend->vif->domid;
-			copy_gop->source.u.ref = src_pend->req.gref;
+			copy_gop->source.u.ref = src_pend->req.hdr.gref;
 			copy_gop->flags |= GNTCOPY_source_gref;
 		} else {
 			void *vaddr = page_address(page);
@@ -465,9 +488,12 @@ static void netbk_gop_frag_copy(struct xenvif *vif, struct sk_buff *skb,
 		size -= bytes;
 
 		/* Leave a gap for the GSO descriptor. */
-		if (*head && skb_shinfo(skb)->gso_size && !vif->gso_prefix)
-			vif->rx.req_cons++;
-
+		if (*head && skb_shinfo(skb)->gso_size && !vif->gso_prefix) {
+			if (vif->large_rings)
+				vif->rings.large.rx.req_cons++;
+			else
+				vif->rings.small.rx.req_cons++;
+		}
 		*head = 0; /* There must be something in this buffer now. */
 
 	}
@@ -501,14 +527,14 @@ static int netbk_gop_skb(struct sk_buff *skb,
 
 	/* Set up a GSO prefix descriptor, if necessary */
 	if (skb_shinfo(skb)->gso_size && vif->gso_prefix) {
-		req = RING_GET_REQUEST(&vif->rx, vif->rx.req_cons++);
+		req = get_next_rx_request(vif);
 		meta = npo->meta + npo->meta_prod++;
 		meta->gso_size = skb_shinfo(skb)->gso_size;
 		meta->size = 0;
 		meta->id = req->id;
 	}
 
-	req = RING_GET_REQUEST(&vif->rx, vif->rx.req_cons++);
+	req = get_next_rx_request(vif);
 	meta = npo->meta + npo->meta_prod++;
 
 	if (!vif->gso_prefix)
@@ -693,25 +719,35 @@ static void xen_netbk_rx_action(struct xen_netbk *netbk)
 				 flags);
 
 		if (netbk->meta[npo.meta_cons].gso_size && !vif->gso_prefix) {
-			struct xen_netif_extra_info *gso =
-				(struct xen_netif_extra_info *)
-				RING_GET_RESPONSE(&vif->rx,
-						  vif->rx.rsp_prod_pvt++);
+			struct netif_gso *gso;
+			if (vif->large_rings) {
+				gso = &RING_GET_RESPONSE(&vif->rings.large.rx,
+							 vif->rings.large.rx.rsp_prod_pvt - 1)->gso;
+			} else {
+				struct xen_netif_extra_info *extra;
+				extra = (struct xen_netif_extra_info *)
+					RING_GET_RESPONSE(&vif->rings.small.rx,
+							  vif->rings.small.rx.rsp_prod_pvt++);
+				extra->type = XEN_NETIF_EXTRA_TYPE_GSO;
+				extra->flags = 0;
+				gso = &extra->u.gso;
+			}
 
-			gso->u.gso.size = netbk->meta[npo.meta_cons].gso_size;
-			gso->u.gso.type = XEN_NETIF_GSO_TYPE_TCPV4;
-			gso->u.gso.pad = 0;
-			gso->u.gso.features = 0;
+			gso->size = netbk->meta[npo.meta_cons].gso_size;
+			gso->type = XEN_NETIF_GSO_TYPE_TCPV4;
+			gso->pad = 0;
+			gso->features = 0;
 
-			gso->type = XEN_NETIF_EXTRA_TYPE_GSO;
-			gso->flags = 0;
 		}
 
 		netbk_add_frag_responses(vif, status,
 					 netbk->meta + npo.meta_cons + 1,
 					 sco->meta_slots_used);
 
-		RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(&vif->rx, ret);
+		if (vif->large_rings)
+			RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(&vif->rings.large.rx, ret);
+		else
+			RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(&vif->rings.small.rx, ret);
 		irq = vif->irq;
 		if (ret && list_empty(&vif->notify_list))
 			list_add_tail(&vif->notify_list, &notify);
@@ -819,8 +855,10 @@ void xen_netbk_check_rx_xenvif(struct xenvif *vif)
 {
 	int more_to_do;
 
-	RING_FINAL_CHECK_FOR_REQUESTS(&vif->tx, more_to_do);
-
+	if (vif->large_rings)
+		RING_FINAL_CHECK_FOR_REQUESTS(&vif->rings.large.tx, more_to_do);
+	else
+		RING_FINAL_CHECK_FOR_REQUESTS(&vif->rings.small.tx, more_to_do);
 	if (more_to_do)
 		xen_netbk_schedule_xenvif(vif);
 }
@@ -833,7 +871,10 @@ static void tx_add_credit(struct xenvif *vif)
 	 * Allow a burst big enough to transmit a jumbo packet of up to 128kB.
 	 * Otherwise the interface can seize up due to insufficient credit.
 	 */
-	max_burst = RING_GET_REQUEST(&vif->tx, vif->tx.req_cons)->size;
+	if (vif->large_rings)
+		max_burst = RING_GET_REQUEST(&vif->rings.large.tx, vif->rings.large.tx.req_cons)->hdr.size;
+	else
+		max_burst = RING_GET_REQUEST(&vif->rings.small.tx, vif->rings.small.tx.req_cons)->size;
 	max_burst = min(max_burst, 131072UL);
 	max_burst = max(max_burst, vif->credit_bytes);
 
@@ -853,27 +894,42 @@ static void tx_credit_callback(unsigned long data)
 }
 
 static void netbk_tx_err(struct xenvif *vif,
-			 struct xen_netif_tx_request *txp, RING_IDX end)
+			 struct xen_netif_tx_request_small *txp,
+			 RING_IDX end)
 {
-	RING_IDX cons = vif->tx.req_cons;
-
-	do {
-		make_tx_response(vif, txp, XEN_NETIF_RSP_ERROR);
-		if (cons >= end)
-			break;
-		txp = RING_GET_REQUEST(&vif->tx, cons++);
-	} while (1);
-	vif->tx.req_cons = cons;
+	RING_IDX cons;
+	if (vif->large_rings) {
+		cons = vif->rings.large.tx.req_cons;
+		do {
+			make_tx_response(vif, txp, XEN_NETIF_RSP_ERROR);
+			if (cons >= end)
+				break;
+			txp = &RING_GET_REQUEST(&vif->rings.large.tx, cons++)->hdr;
+		} while (1);
+		vif->rings.large.tx.req_cons = cons;
+	} else {
+		cons = vif->rings.small.tx.req_cons;
+		do {
+			make_tx_response(vif, txp, XEN_NETIF_RSP_ERROR);
+			if (cons >= end)
+				break;
+			txp = RING_GET_REQUEST(&vif->rings.small.tx, cons++);
+		} while (1);
+		vif->rings.small.tx.req_cons = cons;
+	}
 	xen_netbk_check_rx_xenvif(vif);
 	xenvif_put(vif);
 }
 
 static int netbk_count_requests(struct xenvif *vif,
-				struct xen_netif_tx_request *first,
-				struct xen_netif_tx_request *txp,
+				struct xen_netif_tx_request_small *first,
+				union xen_netif_tx_request *txp,
 				int work_to_do)
 {
-	RING_IDX cons = vif->tx.req_cons;
+	RING_IDX cons =
+		vif->large_rings ?
+		vif->rings.large.tx.req_cons :
+		vif->rings.small.tx.req_cons;
 	int frags = 0;
 
 	if (!(first->flags & XEN_NETTXF_more_data))
@@ -925,7 +981,7 @@ static struct page *xen_netbk_alloc_page(struct xen_netbk *netbk,
 static struct gnttab_copy *xen_netbk_get_requests(struct xen_netbk *netbk,
 						  struct xenvif *vif,
 						  struct sk_buff *skb,
-						  struct xen_netif_tx_request *txp,
+						  union xen_netif_tx_request *txp,
 						  struct gnttab_copy *gop)
 {
 	struct skb_shared_info *shinfo = skb_shinfo(skb);
@@ -978,7 +1034,7 @@ static int xen_netbk_tx_check_gop(struct xen_netbk *netbk,
 	u16 pending_idx = *((u16 *)skb->data);
 	struct pending_tx_info *pending_tx_info = netbk->pending_tx_info;
 	struct xenvif *vif = pending_tx_info[pending_idx].vif;
-	struct xen_netif_tx_request *txp;
+	union xen_netif_tx_request *txp;
 	struct skb_shared_info *shinfo = skb_shinfo(skb);
 	int nr_frags = shinfo->nr_frags;
 	int i, err, start;
@@ -1047,7 +1103,7 @@ static void xen_netbk_fill_frags(struct xen_netbk *netbk, struct sk_buff *skb)
 
 	for (i = 0; i < nr_frags; i++) {
 		skb_frag_t *frag = shinfo->frags + i;
-		struct xen_netif_tx_request *txp;
+		union xen_netif_tx_request *txp;
 		struct page *page;
 		u16 pending_idx;
 
@@ -1232,8 +1288,8 @@ static unsigned xen_netbk_tx_build_gops(struct xen_netbk *netbk)
 	while (((nr_pending_reqs(netbk) + MAX_SKB_FRAGS) < MAX_PENDING_REQS) &&
 		!list_empty(&netbk->net_schedule_list)) {
 		struct xenvif *vif;
-		struct xen_netif_tx_request txreq;
-		struct xen_netif_tx_request txfrags[MAX_SKB_FRAGS];
+		union xen_netif_tx_request txreq;
+		union xen_netif_tx_request txfrags[MAX_SKB_FRAGS];
 		struct page *page;
 		struct xen_netif_extra_info extras[XEN_NETIF_EXTRA_TYPE_MAX-1];
 		u16 pending_idx;
@@ -1401,7 +1457,7 @@ static void xen_netbk_tx_submit(struct xen_netbk *netbk)
 	struct sk_buff *skb;
 
 	while ((skb = __skb_dequeue(&netbk->tx_queue)) != NULL) {
-		struct xen_netif_tx_request *txp;
+		union xen_netif_tx_request *txp;
 		struct xenvif *vif;
 		u16 pending_idx;
 		unsigned data_len;
@@ -1510,7 +1566,7 @@ static void xen_netbk_idx_release(struct xen_netbk *netbk, u16 pending_idx)
 }
 
 static void make_tx_response(struct xenvif *vif,
-			     struct xen_netif_tx_request *txp,
+			     struct xen_netif_tx_request_small *txp,
 			     s8       st)
 {
 	RING_IDX i = vif->tx.rsp_prod_pvt;
